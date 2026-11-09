@@ -1,0 +1,315 @@
+{
+  "schema_version": 1,
+  "protocol": 1,
+  "link_id": "0123456789abcdef0123456789abcdef",
+  "description": "Shared wire-conformance corpus for protocol v1. Both the Python suite (tests/test_protocol_fixture.py) and the C# contract suite (tests/windows/ContractTests.cs) reconstruct these frames with their own codec and compare decoded frames, never source text.",
+  "split_at_every_byte": {
+    "first": {
+      "v": 1,
+      "channel": "fs",
+      "type": "request",
+      "link_id": "0123456789abcdef0123456789abcdef",
+      "request_id": 7,
+      "op": "write",
+      "body": {
+        "nombre": "á/東京",
+        "empty": ""
+      }
+    },
+    "second": {
+      "v": 1,
+      "channel": "control",
+      "type": "heartbeat",
+      "link_id": "0123456789abcdef0123456789abcdef"
+    },
+    "second_crlf": true
+  },
+  "banner_and_resync": {
+    "prefix_b64": "RVNQLVJPTSBib290Cv/+Cgo=",
+    "frame": {
+      "v": 1,
+      "channel": "control",
+      "type": "heartbeat",
+      "link_id": "0123456789abcdef0123456789abcdef"
+    },
+    "expected_error_codes": [
+      "invalid_json",
+      "invalid_json"
+    ]
+  },
+  "utf8_round_trip": {
+    "frame": {
+      "v": 1,
+      "channel": "fs",
+      "type": "request",
+      "link_id": "0123456789abcdef0123456789abcdef",
+      "request_id": 3,
+      "op": "write",
+      "body": {
+        "nombre": "á/東京",
+        "emoji": "🧵"
+      }
+    },
+    "binary_chunk_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f",
+    "data_session_id": "pty",
+    "data_seq": 3
+  },
+  "exact_maximum": {
+    "template": {
+      "v": 1,
+      "channel": "fs",
+      "type": "request",
+      "link_id": "0123456789abcdef0123456789abcdef",
+      "request_id": 1,
+      "op": "write",
+      "body": {
+        "padding": ""
+      }
+    },
+    "padding_byte": 120,
+    "max_frame_bytes": 4096,
+    "overflow_bytes": 4097,
+    "valid_after_overflow": {
+      "v": 1,
+      "channel": "control",
+      "type": "heartbeat",
+      "link_id": "0123456789abcdef0123456789abcdef"
+    },
+    "expected_overflow_code": "frame_too_large"
+  },
+  "rejections": [
+    {
+      "name": "version",
+      "frame": {
+        "v": 2,
+        "channel": "control",
+        "type": "heartbeat",
+        "link_id": "0123456789abcdef0123456789abcdef"
+      },
+      "direction": null,
+      "code": "unsupported_version"
+    },
+    {
+      "name": "channel",
+      "frame": {
+        "v": 1,
+        "channel": "unknown",
+        "type": "heartbeat",
+        "link_id": "0123456789abcdef0123456789abcdef"
+      },
+      "direction": null,
+      "code": "invalid_channel"
+    },
+    {
+      "name": "type",
+      "frame": {
+        "v": 1,
+        "channel": "control",
+        "type": "wat",
+        "link_id": "0123456789abcdef0123456789abcdef"
+      },
+      "direction": null,
+      "code": "invalid_type"
+    },
+    {
+      "name": "link_id",
+      "frame": {
+        "v": 1,
+        "channel": "control",
+        "type": "heartbeat",
+        "link_id": "0123456789ABCDEF0123456789abcdef"
+      },
+      "direction": null,
+      "code": "invalid_link_id"
+    },
+    {
+      "name": "request_without_id",
+      "frame": {
+        "v": 1,
+        "channel": "hid",
+        "type": "request",
+        "link_id": "0123456789abcdef0123456789abcdef",
+        "op": "health"
+      },
+      "direction": null,
+      "code": "invalid_frame"
+    },
+    {
+      "name": "body_not_object",
+      "frame": {
+        "v": 1,
+        "channel": "control",
+        "type": "response",
+        "link_id": "0123456789abcdef0123456789abcdef",
+        "request_id": 1,
+        "op": "bind",
+        "body": []
+      },
+      "direction": null,
+      "code": "invalid_frame"
+    },
+    {
+      "name": "unknown_direction",
+      "frame": {
+        "v": 1,
+        "channel": "control",
+        "type": "heartbeat",
+        "link_id": "0123456789abcdef0123456789abcdef"
+      },
+      "direction": "sideways",
+      "code": "invalid_direction"
+    },
+    {
+      "name": "direction_denied_master_view",
+      "frame": {
+        "v": 1,
+        "channel": "hid",
+        "type": "request",
+        "link_id": "0123456789abcdef0123456789abcdef",
+        "request_id": 1,
+        "op": "health"
+      },
+      "direction": "firmware_to_master",
+      "code": "direction_denied"
+    },
+    {
+      "name": "direction_denied_slave_view",
+      "frame": {
+        "v": 1,
+        "channel": "hid",
+        "type": "response",
+        "link_id": "0123456789abcdef0123456789abcdef",
+        "request_id": 1,
+        "op": "health"
+      },
+      "direction": "master_to_firmware",
+      "code": "direction_denied"
+    }
+  ],
+  "base64_rejections": [
+    {
+      "name": "space",
+      "value": "SGVs bG8=",
+      "code": "invalid_base64"
+    },
+    {
+      "name": "tab",
+      "value": "SGVsbG8=\t",
+      "code": "invalid_base64"
+    },
+    {
+      "name": "bad_padding_length",
+      "value": "SGVsbG8",
+      "code": "invalid_base64"
+    },
+    {
+      "name": "padding_in_the_middle",
+      "value": "SG=sbG8=",
+      "code": "invalid_base64"
+    }
+  ],
+  "chunk_limit": {
+    "chunk_bytes": 513,
+    "code": "chunk_too_large"
+  },
+  "dedup_sequence": {
+    "limit": 2,
+    "operations": [
+      {
+        "link_id": "0123456789abcdef0123456789abcdef",
+        "session_id": "session",
+        "seq": 1,
+        "add": true
+      },
+      {
+        "link_id": "0123456789abcdef0123456789abcdef",
+        "session_id": "session",
+        "seq": 1,
+        "add": false
+      },
+      {
+        "link_id": "0123456789abcdef0123456789abcdef",
+        "session_id": "session",
+        "seq": 2,
+        "add": true
+      },
+      {
+        "link_id": "0123456789abcdef0123456789abcdef",
+        "session_id": "session",
+        "seq": 3,
+        "add": true
+      },
+      {
+        "link_id": "0123456789abcdef0123456789abcdef",
+        "session_id": "session",
+        "seq": 1,
+        "add": true
+      }
+    ],
+    "seen_without_registering": {
+      "link_id": "0123456789abcdef0123456789abcdef",
+      "session_id": "other",
+      "seq": 9
+    }
+  },
+  "window_bounds": {
+    "default": 8,
+    "maximum": 64,
+    "invalid_fallbacks": [
+      0,
+      -1,
+      65,
+      1000
+    ],
+    "valid": [
+      1,
+      8,
+      64
+    ]
+  },
+  "transfer_window_corpus": {
+    "description": "Shared transfer-level corpus: the same block stream, window bounds and terminal conditions are asserted by tests/test_protocol_fixture.py and by tests/windows/ContractTests.cs.",
+    "block_bytes": 512,
+    "empty_transfer": {
+      "size": 0,
+      "blocks": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "final_partial_block": {
+      "size": 1200,
+      "blocks": 3,
+      "last_block_bytes": 176
+    },
+    "windows": [
+      {
+        "window": 1,
+        "max_in_flight_before_ack": 1
+      },
+      {
+        "window": 8,
+        "max_in_flight_before_ack": 8
+      },
+      {
+        "window": 64,
+        "max_in_flight_before_ack": 64
+      }
+    ],
+    "invalid_window_falls_back_to": 8,
+    "lost_ack": {
+      "description": "The first ACK is dropped; the retransmission of the same seq must be accepted exactly once and re-ACKed.",
+      "session_id": "lost-ack",
+      "seq": 0,
+      "expected_acks": 2,
+      "expected_applications": 1
+    },
+    "retry_exhaustion": {
+      "description": "No ACK at all: 1 initial transmission plus 3 retransmissions, then ack_timeout.",
+      "session_id": "no-ack",
+      "seq": 0,
+      "ack_timeout_ms": 1000,
+      "retransmissions": 3,
+      "total_transmissions": 4,
+      "expected_code": "ack_timeout"
+    }
+  }
+}

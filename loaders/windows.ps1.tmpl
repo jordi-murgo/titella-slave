@@ -1,0 +1,332 @@
+# Titella Windows bootstrap loader (PowerShell 5.1, .NET Framework 4.7.2+).
+#
+# Typed over HID as gzip+base64 accumulation lines and executed as a
+# ScriptBlock: the encoding is transport, not obfuscation, and this readable
+# template is its source. It never changes the execution policy, never
+# downloads anything and never asks for elevation.
+#
+# It is written to be small: everything the slave needs is already available in
+# the payload the master sends over the CDC, so the typed text only has to
+# open the port, frame the blocks, verify the digest and start the agent.
+#
+# Placeholders: __LINK_ID__, __SESSION_ID__, __CDC_PORT__ (empty = resolve the
+# port from the PnP identity of the rig).
+$ErrorActionPreference = 'Stop'
+try { Set-PSReadLineOption -HistorySaveStyle SaveNothing } catch { }
+$script:L = '__LINK_ID__'
+$script:S = '__SESSION_ID__'
+$script:Pin = '__CDC_PORT__'
+if (-not ($script:Sp -and $script:Sp.IsOpen)) { $script:Sp = $null }
+$script:Rx = $null      # read stream
+$script:Tx = $null      # write stream
+$script:Rt = $null      # bootstrap directory
+$script:Cs = $null      # payload path
+$script:Pt = $null      # partial path
+$script:Wr = $null      # writer
+$script:Ds = 0          # declared size
+$script:Dh = ''         # declared sha256
+$script:Sq = 0          # next sequence
+$script:Pr = $null      # pending request
+$script:Po = $null      # pending op
+
+function Fail([string]$Code, [string]$Message) {
+  $e = New-Object System.Exception $Message
+  $e.Data['titella_code'] = $Code
+  return $e
+}
+
+function Log([string]$Message) {
+  if (-not $script:Rt) { return }
+  try {
+    [IO.File]::AppendAllText((Join-Path $script:Rt 'loader.log'),
+      ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') + ' ' + $Message + "`r`n"),
+      (New-Object System.Text.UTF8Encoding $false))
+  } catch { }
+}
+
+function Send($Frame) {
+  if (-not $script:Tx) { return }
+  $b = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json $Frame -Compress -Depth 8) + "`n")
+  $script:Tx.Write($b, 0, $b.Length)
+  $script:Tx.Flush()
+}
+
+function Error-Frame([string]$Code, [string]$Message) {
+  if ($script:Tx) {
+    $f = @{ v = 1; channel = 'bootstrap'; type = 'error'; link_id = $script:L }
+    if ($null -ne $script:Pr) { $f['request_id'] = $script:Pr; $f['op'] = $script:Po } else { $f['session_id'] = $script:S }
+    $f['body'] = @{ code = $Code; message = $Message; retryable = $false }
+    try { Send $f } catch { }
+  }
+  [Console]::Error.WriteLine('titella loader: ' + $Code + ': ' + $Message)
+}
+
+function Close-Cdc {
+  if ($script:Sp) { try { $script:Sp.Close() } catch { }; try { $script:Sp.Dispose() } catch { } }
+  $script:Sp = $null; $script:Rx = $null; $script:Tx = $null
+}
+
+function Open-Cdc([string]$Name) {
+  $last = ''
+  foreach ($wait in 0, 500, 1000, 2000, 5000) {
+    if ($wait) { Start-Sleep -Milliseconds $wait }
+    try {
+      $s = New-Object System.IO.Ports.SerialPort $Name, 115200, 'None', 8, 'One'
+      $s.Handshake = 'None'
+      # Arduino USB CDC reports itself connected only while both DTR and RTS
+      # are asserted; the firmware disables 1200-baud reboot, so asserting both
+      # lines cannot reset the ESP32-S3.
+      $s.DtrEnable = $true
+      $s.RtsEnable = $true
+      $s.ReadTimeout = 300
+      $s.WriteTimeout = 2000
+      $s.Open()
+      $script:Sp = $s
+      $script:Rx = $s.BaseStream
+      $script:Tx = $s.BaseStream
+      return $true
+    } catch {
+      $last = $_.Exception.Message
+      if ($s) { try { $s.Dispose() } catch { } }
+      $s = $null; $script:Sp = $null; $script:Rx = $null; $script:Tx = $null
+    }
+  }
+  Log ('could not open ' + $Name + ': ' + $last)
+  return $false
+}
+
+function Resolve-Port {
+  # An explicit override always wins. Without one only the port of this rig is
+  # accepted: the firmware enumerates with the Espressif vendor id and a
+  # TITELLA- serial, so an unrelated COM device is never opened or written to.
+  $list = @()
+  if ($script:Pin) {
+    if ($script:Pin -notmatch '^COM[1-9][0-9]*$') {
+      throw (Fail 'invalid_argument' ('slave_cdc_port must match COM[1-9][0-9]*, got ' + $script:Pin))
+    }
+    return @($script:Pin)
+  }
+  if (-not (Get-Command Get-PnpDevice -ErrorAction SilentlyContinue)) {
+    throw (Fail 'cdc_not_found' 'this Windows does not expose the PnP device identity: pass slave_cdc_port explicitly')
+  }
+  $present = @([IO.Ports.SerialPort]::GetPortNames())
+  foreach ($d in @(Get-PnpDevice -Class Ports -ErrorAction SilentlyContinue)) {
+    if (-not $d.InstanceId -or -not ($d.FriendlyName -match '\(COM([1-9][0-9]*)\)')) { continue }
+    $com = 'COM' + $Matches[1]
+    if ($present -notcontains $com) { continue }
+    if ($d.InstanceId -match 'VID_303A' -or $d.InstanceId -match 'TITELLA-' -or
+        [string]$d.FriendlyName -like 'Titella KVM*') {
+      if ($list -notcontains $com) { $list += $com }
+    }
+  }
+  if ($list.Count -eq 0) {
+    throw (Fail 'cdc_not_found' 'no Titella KVM CDC port was identified: pass slave_cdc_port explicitly')
+  }
+  if ($list.Count -gt 1) {
+    throw (Fail 'cdc_ambiguous' ('several Titella CDC ports are present (' + ($list -join ', ') + '): pass slave_cdc_port explicitly'))
+  }
+  return @($list[0])
+}
+
+function Complete-Commit([int]$RequestId) {
+  if (-not $script:Wr) { throw (Fail 'invalid_argument' 'commit without a begin') }
+  $script:Pr = $RequestId
+  $script:Po = 'commit'
+  $script:Wr.Flush($true)
+  $script:Wr.Dispose()
+  $script:Wr = $null
+  $bytes = [IO.File]::ReadAllBytes($script:Pt)
+  if ($bytes.Length -ne $script:Ds) {
+    throw (Fail 'size_mismatch' ('received ' + $bytes.Length + ' of ' + $script:Ds + ' bytes'))
+  }
+  $h = [Security.Cryptography.SHA256]::Create()
+  try { $hex = ([BitConverter]::ToString($h.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant() }
+  finally { $h.Dispose() }
+  if ($hex -ne $script:Dh.ToLowerInvariant()) {
+    throw (Fail 'checksum_mismatch' 'the received payload does not match the declared SHA-256')
+  }
+  if (Test-Path -LiteralPath $script:Cs) { [IO.File]::Delete($script:Cs) }
+  [IO.File]::Move($script:Pt, $script:Cs)
+  Send @{
+    v = 1; channel = 'bootstrap'; type = 'response'; link_id = $script:L
+    request_id = $RequestId; op = 'commit'
+    body = @{ status = 'started'; size = $bytes.Length; sha256 = $hex }
+  }
+  $script:Pr = $null
+  $script:Po = $null
+}
+
+function Start-Agent([string]$Name) {
+  $fw = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319'
+  if (-not (Test-Path -LiteralPath $fw)) { $fw = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319' }
+  $sma = Join-Path $env:WINDIR 'Microsoft.NET\assembly\GAC_MSIL\System.Management.Automation'
+  $sma = Get-ChildItem $sma -Recurse -Filter 'System.Management.Automation.dll' -ErrorAction SilentlyContinue |
+    Select-Object -First 1 -ExpandProperty FullName
+  $refs = @('System.dll', 'System.Core.dll', 'System.Web.Extensions.dll') |
+    ForEach-Object { '"' + (Join-Path $fw $_) + '"' }
+  if ($sma) { $refs += '"' + $sma + '"' }
+  # One short command: compile the received source to a DLL on disk (so job
+  # children can LoadFrom it later) and run the agent. The child
+  # interpolates; every literal here is already quoted.
+  $dll = Join-Path $script:Rt 'agent.dll'
+  $cmd = 'try{$ErrorActionPreference="Stop";Add-Type -LiteralPath "' + $script:Cs +
+    '" -IgnoreWarnings -OutputAssembly "' + $dll + '" -ReferencedAssemblies ' + ($refs -join ',') +
+    '}catch{[IO.File]::WriteAllText("' + (Join-Path $script:Rt 'agent-compile.err.log') +
+    '",[string]$_,(New-Object Text.UTF8Encoding $false));exit 1}' +
+    ';exit [Reflection.Assembly]::LoadFrom("' + $dll + '").GetType("Titella.Slave.Agent").' +
+    'GetMethod("Run").Invoke($null,@("' + $script:Rt + '","' + $script:L + '","' + $Name + '",5000,30000))'
+  $psi = New-Object Diagnostics.ProcessStartInfo (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe')
+  $psi.Arguments = '-NoLogo -NoProfile -NonInteractive -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
+  $psi.WorkingDirectory = $script:Rt
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  [Diagnostics.Process]::Start($psi) | Out-Null
+}
+
+try {
+  # Environment gates: a block is reported, never worked around.
+  if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
+    [Console]::Error.WriteLine('titella loader: FullLanguage is required (language mode: ' +
+      [string]$ExecutionContext.SessionState.LanguageMode + ')')
+    exit 1
+  }
+  $ndp = $null
+  try { $ndp = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full' -ErrorAction Stop } catch { }
+  if (-not $ndp -or -not $ndp.Release -or [int]$ndp.Release -lt 461808) {
+    [Console]::Error.WriteLine('titella loader: .NET Framework 4.7.2 or later is required')
+    exit 1
+  }
+  $dotnet = [string]$ndp.Version
+
+  $script:Rt = Join-Path ([IO.Path]::GetTempPath()) ([Guid]::NewGuid().ToString('N').Substring(0, 16))
+  New-Item -ItemType Directory -Path $script:Rt | Out-Null
+  $script:Cs = Join-Path $script:Rt 'payload.cs'
+  $script:Pt = Join-Path $script:Rt '.part'
+
+  if ($script:Sp -and $script:Sp.IsOpen) {
+    # Reuse the port opened by the stub so COMx is opened only once in
+    # PowerShell and DTR/RTS stay asserted across Stage 1 and Stage 2.
+    $name = $script:Sp.PortName
+    $script:Sp.ReadTimeout = 300
+    $script:Sp.WriteTimeout = 2000
+    $script:Rx = $script:Sp.BaseStream
+    $script:Tx = $script:Sp.BaseStream
+  } else {
+    $candidates = Resolve-Port
+    $opened = $false
+    foreach ($name in $candidates) {
+      if (Open-Cdc $name) { $opened = $true; break }
+    }
+    if (-not $opened) {
+      throw (Fail 'cdc_not_found' ('could not open ' + ($candidates -join ', ') + ': pass slave_cdc_port explicitly'))
+    }
+  }
+  Log ('opened ' + $name)
+  Send @{
+    v = 1; channel = 'bootstrap'; type = 'event'; link_id = $script:L
+    session_id = $script:S; op = 'loader.ready'; body = @{ dotnet = $dotnet }
+  }
+
+  # Bounded framing: 4096-byte lines, discarding up to the next LF on overflow.
+  $read = New-Object byte[] 4096
+  $line = New-Object byte[] 4097
+  $len = 0
+  $deadline = [DateTime]::UtcNow.AddSeconds(180)
+  while ([DateTime]::UtcNow -lt $deadline) {
+    $avail = 0
+    try { $avail = $script:Sp.BytesToRead } catch { throw (Fail 'cdc_disconnected' ('the CDC is gone: ' + $_.Exception.Message)) }
+    if ($avail -le 0) { Start-Sleep -Milliseconds 15; continue }
+    if ($avail -gt $read.Length) { $avail = $read.Length }
+    $count = $script:Rx.Read($read, 0, $avail)
+    if ($count -le 0) { continue }
+    $at = 0
+    while ($at -lt $count) {
+      $lf = [Array]::IndexOf($read, [byte]10, $at, $count - $at)
+      $end = if ($lf -lt 0) { $count } else { $lf }
+      $span = $end - $at
+      if ($len + $span -gt 4096) { $len = 4097 }
+      elseif ($span -gt 0) { [Array]::Copy($read, $at, $line, $len, $span); $len += $span }
+      if ($lf -lt 0) { break }
+      $text = ''
+      if ($len -le 4096) { $text = [Text.Encoding]::UTF8.GetString($line, 0, $len).TrimEnd([char]13) }
+      $len = 0
+      $at = $lf + 1
+      if (-not $text) { continue }
+      $f = $null
+      try { $f = $text | ConvertFrom-Json } catch { continue }
+      if ($null -eq $f -or $f.v -ne 1 -or $f.link_id -ne $script:L -or $f.channel -ne 'bootstrap') { continue }
+      if ($f.type -eq 'request') {
+        $rid = $f.request_id
+        if ($null -eq $rid) { continue }
+        if ([string]$f.op -eq 'begin') {
+          $body = $f.body
+          if ($null -eq $body) { throw (Fail 'invalid_argument' 'begin without a body') }
+          $size = $body.size
+          $sha = [string]$body.sha256
+          if ($null -eq $size -or [long]$size -lt 0 -or $sha.Length -ne 64) {
+            throw (Fail 'invalid_argument' 'begin requires size and sha256')
+          }
+          if ($script:Wr) { try { $script:Wr.Dispose() } catch { }; $script:Wr = $null }
+          $script:Ds = [long]$size
+          $script:Dh = $sha
+          $script:Sq = 0
+          $script:Pr = $rid
+          $script:Po = 'begin'
+          $script:Wr = [IO.File]::Open($script:Pt, 'Create', 'Write', 'None')
+          Send @{
+            v = 1; channel = 'bootstrap'; type = 'response'; link_id = $script:L
+            request_id = $rid; op = 'begin'
+            body = @{ status = 'ready'; session_id = $script:S }
+          }
+          $script:Pr = $null
+          $script:Po = $null
+        } elseif ([string]$f.op -eq 'commit') {
+          Complete-Commit $rid
+          # $port would alias $script:Sp's neighbour name space; keep the
+          # resolved name in its own variable before the port is closed.
+          $resolved = $name
+          Close-Cdc
+          Log ('payload installed, starting the agent on ' + $resolved)
+          Start-Agent $resolved
+          exit 0
+        }
+      } elseif ($f.type -eq 'data') {
+        if (-not $script:Wr -or [string]$f.session_id -ne $script:S) { continue }
+        $seq = $f.seq
+        if (-not ($seq -is [int]) -and -not ($seq -is [long])) { continue }
+        $seq = [int]$seq
+        if ($seq -lt 0 -or -not ($f.data_b64 -is [string])) { continue }
+        $chunk = $null
+        try { $chunk = [Convert]::FromBase64String([string]$f.data_b64) }
+        catch { throw (Fail 'invalid_argument' 'data carries invalid base64') }
+        if ($chunk.Length -gt 512) { throw (Fail 'invalid_argument' 'a data chunk exceeds 512 bytes') }
+        if ($seq -eq $script:Sq) { $script:Wr.Write($chunk, 0, $chunk.Length); $script:Sq++ }
+        if ($seq -le $script:Sq) {
+          Send @{ v = 1; channel = 'bootstrap'; type = 'ack'; link_id = $script:L; session_id = $script:S; ack_seq = $seq }
+        }
+      }
+    }
+  }
+  throw (Fail 'bootstrap_timeout' 'the bootstrap did not complete within its deadline')
+} catch {
+  $code = 'bootstrap_failed'
+  $message = $_.Exception.Message
+  $c = $_.Exception
+  while ($c) {
+    if ($c.Data -and $c.Data.Contains('titella_code')) {
+      $code = [string]$c.Data['titella_code']
+      $message = $c.Message
+      break
+    }
+    $c = $c.InnerException
+  }
+  Log ($code + ': ' + $message)
+  if ($script:Wr) { try { $script:Wr.Dispose() } catch { }; $script:Wr = $null }
+  if ($script:Pt -and (Test-Path -LiteralPath $script:Pt)) { try { [IO.File]::Delete($script:Pt) } catch { } }
+  Error-Frame $code $message
+  Close-Cdc
+  if ($script:Rt -and (Test-Path -LiteralPath $script:Rt) -and ((Split-Path -Leaf $script:Rt) -match '^[0-9a-f]{16}$')) {
+    try { [IO.Directory]::Delete($script:Rt, $true) } catch { }
+  }
+  exit 1
+}

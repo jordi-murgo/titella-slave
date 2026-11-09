@@ -1,0 +1,17 @@
+# Slave assets wheel: everything the build hook reads must travel in the sdist
+# so that "python -m build" works from an unpacked sdist with no sibling
+# checkout. Paths are repository-relative; no absolute paths.
+include pyproject.toml
+include setup.py
+include build_support.py
+include README.md
+include MANIFEST.in
+recursive-include src *.py
+recursive-include implementations *.py
+recursive-include implementations *.cs
+recursive-include loaders *.tmpl
+include docs/*.md
+recursive-include tests *.py
+recursive-include tests *.json
+recursive-include tests *.cs
+global-exclude __pycache__ *.py[cod] *.egg-info
