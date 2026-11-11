@@ -184,6 +184,36 @@
       },
       "direction": "master_to_firmware",
       "code": "direction_denied"
+    },
+    {
+      "name": "video_from_slave_is_denied",
+      "frame": {
+        "v": 1,
+        "channel": "video",
+        "type": "request",
+        "link_id": "0123456789abcdef0123456789abcdef",
+        "request_id": 1,
+        "op": "video_begin",
+        "body": {
+          "bytes": 1024
+        }
+      },
+      "direction": "slave_to_firmware",
+      "code": "direction_denied"
+    },
+    {
+      "name": "video_response_from_master_is_denied",
+      "frame": {
+        "v": 1,
+        "channel": "video",
+        "type": "response",
+        "link_id": "0123456789abcdef0123456789abcdef",
+        "request_id": 2,
+        "op": "video_status",
+        "body": {}
+      },
+      "direction": "master_to_firmware",
+      "code": "direction_denied"
     }
   ],
   "base64_rejections": [

@@ -39,7 +39,7 @@ namespace Titella.Slave
 
         public static readonly string[] Channels = new string[]
         {
-            "hid", "control", "bootstrap", "shell", "fs", "transfer",
+            "hid", "video", "control", "bootstrap", "shell", "fs", "transfer",
         };
 
         public static readonly string[] Types = new string[]
@@ -80,6 +80,7 @@ namespace Titella.Slave
 
             Dictionary<string, string[]> masterToFirmware = MasterTypes();
             masterToFirmware["hid"] = new string[] { "request" };
+            masterToFirmware["video"] = new string[] { "request" };
             table[MasterToFirmware] = masterToFirmware;
 
             table[FirmwareToSlave] = MasterTypes();
@@ -88,6 +89,7 @@ namespace Titella.Slave
 
             Dictionary<string, string[]> firmwareToMaster = SlaveTypes();
             firmwareToMaster["hid"] = new string[] { "response", "error" };
+            firmwareToMaster["video"] = new string[] { "response", "error" };
             table[FirmwareToMaster] = firmwareToMaster;
 
             return table;

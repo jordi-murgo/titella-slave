@@ -16,7 +16,7 @@ MAX_REQUESTS = 256
 MAX_DEDUP_ENTRIES = 1024
 MAX_OUTBOUND_FRAMES = 1024
 
-CHANNELS = frozenset(("hid", "control", "bootstrap", "shell", "fs", "transfer"))
+CHANNELS = frozenset(("hid", "video", "control", "bootstrap", "shell", "fs", "transfer"))
 TYPES = frozenset(("hello", "heartbeat", "request", "response", "data", "ack", "event", "error"))
 LINK_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
@@ -40,10 +40,18 @@ _SLAVE_TYPES = {
     "transfer": frozenset(("response", "data", "ack", "event", "error")),
 }
 DIRECTION_TYPES = {
-    MASTER_TO_FIRMWARE: {"hid": frozenset(("request",)), **_MASTER_TYPES},
+    MASTER_TO_FIRMWARE: {
+        "hid": frozenset(("request",)),
+        "video": frozenset(("request",)),
+        **_MASTER_TYPES,
+    },
     FIRMWARE_TO_SLAVE: dict(_MASTER_TYPES),
     SLAVE_TO_FIRMWARE: dict(_SLAVE_TYPES),
-    FIRMWARE_TO_MASTER: {"hid": frozenset(("response", "error")), **_SLAVE_TYPES},
+    FIRMWARE_TO_MASTER: {
+        "hid": frozenset(("response", "error")),
+        "video": frozenset(("response", "error")),
+        **_SLAVE_TYPES,
+    },
 }
 
 
