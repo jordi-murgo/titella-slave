@@ -20,11 +20,15 @@ from titella_slave_assets.wire import PROTOCOL_VERSION as _WIRE_PROTOCOL_VERSION
 # Manifest contract; must stay in lockstep with build_support.py. The
 # protocol version is not re-declared here: it comes from the canonical wire
 # codec, so the bundle API can never disagree with the frames it validates.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 PROTOCOL_VERSION = _WIRE_PROTOCOL_VERSION
 IMPLEMENTATIONS = ("python", "windows-dotnet")
 MAX_MANIFEST_BYTES = 64 * 1024
 MAX_LOADER_BYTES = 512 * 1024
+# The Windows HID bootstrap artifacts are bounded before they reach the
+# loader renderer; both are refused rather than truncated above this size.
+MAX_HID_ARTIFACT_BYTES = 64 * 1024
+HID_BOOTSTRAP_KEYS = ("stage0", "stage0_sha256", "transport", "transport_sha256")
 
 # Public error codes carried by BundleError.code. The plan fixes this exact
 # vocabulary: missing artifact, corrupted/invalid bundle, protocol drift.
@@ -56,6 +60,10 @@ class SlaveBundle:
     payload: bytes
     loader_source: str
     sha256: str
+    # Windows-only: the two artifacts of the USB-only HID bootstrap. Python
+    # has no HID transport and keeps both fields None.
+    hid_stage0_source: str | None = None
+    hid_transport_source: str | None = None
 
 
 def _data_resource() -> Any:
@@ -160,6 +168,50 @@ def _read_artifact(data_dir: Any, name: str) -> bytes:
     return path.read_bytes()
 
 
+def _validate_hid_bootstrap(implementation: str, entry: dict[str, Any]) -> dict[str, Any]:
+    """The Windows entry must carry exactly the four HID bootstrap keys."""
+    if "hid_bootstrap" not in entry:
+        raise BundleError(
+            _CODE_INVALID,
+            f"the manifest entry for {implementation!r} omits hid_bootstrap",
+        )
+    bootstrap = entry["hid_bootstrap"]
+    if not isinstance(bootstrap, dict):
+        raise BundleError(_CODE_INVALID, "the hid_bootstrap block is not an object")
+    if set(bootstrap) != set(HID_BOOTSTRAP_KEYS):
+        raise BundleError(
+            _CODE_INVALID,
+            "the hid_bootstrap block must carry exactly "
+            + ", ".join(HID_BOOTSTRAP_KEYS),
+        )
+    for key in ("stage0_sha256", "transport_sha256"):
+        value = bootstrap[key]
+        if not isinstance(value, str) or len(value) != 64:
+            raise BundleError(_CODE_INVALID, f"hid_bootstrap has an invalid {key}")
+    return bootstrap
+
+
+def _read_hid_artifact(data_dir: Any, name: Any, expected_sha256: str,
+                       label: str) -> str:
+    """Reads one bounded HID artifact and returns its validated source text."""
+    member = _safe_member(name)
+    path = data_dir.joinpath(member)
+    if not path.is_file():
+        raise BundleError(_CODE_MISSING, f"the installed assets lack {label} {member}")
+    data = path.read_bytes()
+    if len(data) > MAX_HID_ARTIFACT_BYTES:
+        raise BundleError(
+            _CODE_INVALID,
+            f"{label} {member} exceeds the {MAX_HID_ARTIFACT_BYTES}-byte bound",
+        )
+    if hashlib.sha256(data).hexdigest() != expected_sha256:
+        raise BundleError(_CODE_INVALID, f"{label} {member} does not match its manifest SHA-256")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise BundleError(_CODE_INVALID, f"{label} {member} is not valid UTF-8: {exc}") from exc
+
+
 def _load_from(data_dir: Any, implementation: str) -> SlaveBundle:
     """Validates and loads one implementation from a ``Traversable`` data dir.
 
@@ -199,6 +251,26 @@ def _load_from(data_dir: Any, implementation: str) -> SlaveBundle:
         loader_source = loader.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise BundleError(_CODE_INVALID, f"{loader_name} is not valid UTF-8: {exc}") from exc
+    hid_stage0_source: str | None = None
+    hid_transport_source: str | None = None
+    if implementation == "windows-dotnet":
+        bootstrap = _validate_hid_bootstrap(implementation, entry)
+        hid_stage0_source = _read_hid_artifact(
+            data_dir, bootstrap["stage0"], bootstrap["stage0_sha256"],
+            "the HID stage0 loader",
+        )
+        hid_transport_source = _read_hid_artifact(
+            data_dir, bootstrap["transport"], bootstrap["transport_sha256"],
+            "the HID transport unit",
+        )
+    elif "hid_bootstrap" in entry:
+        # Schema 2 defines exactly one HID bootstrap: the Windows one. A
+        # Python entry carrying the block is a malformed manifest, and
+        # ignoring it would hide a packaging error.
+        raise BundleError(
+            _CODE_INVALID,
+            f"the manifest entry for {implementation!r} carries hid_bootstrap",
+        )
     return SlaveBundle(
         implementation=implementation,
         protocol=PROTOCOL_VERSION,
@@ -206,6 +278,8 @@ def _load_from(data_dir: Any, implementation: str) -> SlaveBundle:
         payload=payload,
         loader_source=loader_source,
         sha256=entry["sha256"],
+        hid_stage0_source=hid_stage0_source,
+        hid_transport_source=hid_transport_source,
     )
 
 

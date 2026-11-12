@@ -1,7 +1,8 @@
 // Transport and link of the Windows slave: an exclusive Win32 CDC
-// transport, an internal Stream seam used by the contract tests, and the
-// AgentLink that owns the reader/writer/heartbeat threads, the bounded
-// queues, the per-block ACK bookkeeping and the sliding transfer window.
+// transport, a shared-clipboard transport for agent_protocol = "clipboard",
+// an internal Stream seam used by the contract tests, and the AgentLink
+// that owns the reader/writer/heartbeat threads, the bounded queues, the
+// per-block ACK bookkeeping and the sliding transfer window.
 // Port of implementations/python/agent_link.py.
 
 namespace Titella.Slave
@@ -12,6 +13,7 @@ namespace Titella.Slave
     using System.Globalization;
     using System.IO;
     using System.Runtime.InteropServices;
+    using System.Text;
     using System.Threading;
 
     /// <summary>Raised when the transport can no longer carry bytes.</summary>
@@ -105,7 +107,7 @@ namespace Titella.Slave
         }
 
         /// <summary>
-        /// Opens and configures the native USB CDC port: 115200 8N1, no flow
+        /// Opens and configures the native USB CDC port: 2,000,000 8N1, no flow
         /// control, with DTR and RTS asserted because Arduino USB CDC reports
         /// itself connected only while both modem lines are high. The
         /// documented COMMTIMEOUTS poll recipe makes ReadFile return with zero
@@ -148,7 +150,7 @@ namespace Titella.Slave
                 // control/XON/XOFF. DTR_CONTROL_ENABLE occupies bits 4-5;
                 // RTS_CONTROL_ENABLE occupies bits 12-13.
                 dcb.Flags = 0x00001011u;
-                dcb.BaudRate = Win32Constants.CBR_115200;
+                dcb.BaudRate = Win32Constants.CBR_2000000;
                 dcb.ByteSize = 8;
                 dcb.Parity = (byte)Win32Constants.NOPARITY;
                 dcb.StopBits = Win32Constants.ONESTOPBIT;
@@ -280,6 +282,636 @@ namespace Titella.Slave
             {
                 NativeMethods.CloseHandle(handle);
             }
+        }
+    }
+
+    /// <summary>
+    /// Shared-clipboard transport for the window rig (agent_protocol =
+    /// "clipboard"). Frames travel inside TITELLA_S2M/TITELLA_M2S packets
+    /// (header "TITELLA_S2M:&lt;link_id&gt;:&lt;pkt_seq&gt;:&lt;ack_seq&gt;" then
+    /// newline-delimited JSON v1 lines) written as CF_UNICODETEXT, so the
+    /// same protocol runs where a CDC port does not exist. One unacknowledged
+    /// outbound packet at a time; a pure acknowledgement reuses packet
+    /// sequence 0 so it never requires an acknowledgement of its own.
+    ///
+    /// The master sends no idle heartbeats over the clipboard, so Read feeds
+    /// AgentLink a synthetic local heartbeat while the link is quiet:
+    /// AgentLink stays unchanged and its grace clock never expires. Idle
+    /// outbound control heartbeats are dropped here for the mirror reason:
+    /// a quiet link must never touch the user clipboard. The
+    /// ExcludeClipboardContentFromMonitorProcessing and
+    /// CanIncludeInClipboardHistory formats keep the packets out of the
+    /// Windows clipboard history and sync monitors.
+    /// </summary>
+    internal sealed class ClipboardTransport : ILinkTransport
+    {
+        private const int ReadPollMs = 60;
+        private const int ReadStepMs = 15;
+        private const int AckDelayMs = 10;
+        private const int ReassertMs = 150;
+        private const int SynthHeartbeatMs = 2000;
+        private const int MaxPacketLines = 16;
+        private const int MaxReasserts = 40;
+        private const int OpenBudgetMs = 300;
+        private const int ClipboardRetryMs = 10;
+        private const int MaxPartialBytes = WireConstants.FrameBufferBytes * 16;
+        private const int MaxClipboardTextBytes = 4 * 1024 * 1024;
+
+        private readonly string _linkId;
+        // Read and Write both touch the queues and the sequence counters; a
+        // single gate keeps the reader thread, the writer thread and Dispose
+        // from racing. Clipboard calls happen under the gate, so the reader
+        // thread is never inside an open clipboard while another write runs.
+        private readonly object _gate = new object();
+        private readonly MemoryStream _rxBuffer = new MemoryStream();
+        private readonly List<string> _txLines = new List<string>();
+        private readonly MemoryStream _txPartial = new MemoryStream();
+        private bool _open;
+        private long _lastSeenM2sSeq;
+        private long _nextS2mSeq = 1;
+        private long _inflightS2mSeq;
+        private string _inflightPacketText;
+        private long _inflightSentTicks;
+        private int _inflightAttempts;
+        private bool _ackNeeded;
+        private long _ackNeededTicks;
+        private long _lastSynthHeartbeatTicks;
+        private uint _lastClipboardSeqNo;
+        private uint _excludeFormat;
+        private uint _historyFormat;
+
+        public ClipboardTransport(string linkId)
+        {
+            if (!WireConstants.IsLinkId(linkId))
+            {
+                throw new ArgumentException(
+                    "32 lowercase hexadecimal characters are required", "linkId");
+            }
+            _linkId = linkId;
+        }
+
+        /// <summary>True for the sentinel the loader renders for this rig.</summary>
+        internal static bool IsClipboardPort(string port)
+        {
+            return string.Equals(port, "CLIPBOARD", StringComparison.OrdinalIgnoreCase);
+        }
+
+        public void Open()
+        {
+            lock (_gate)
+            {
+                if (_open)
+                {
+                    return;
+                }
+                // Registered formats are process-wide ids; a zero result is
+                // an acceptable degradation, never a fatal error.
+                _excludeFormat = SafeRegisterFormat(
+                    "ExcludeClipboardContentFromMonitorProcessing");
+                _historyFormat = SafeRegisterFormat(
+                    "CanIncludeInClipboardHistory");
+                if (!ClipboardReachable(OpenBudgetMs))
+                {
+                    throw new LinkLostException(0, "the clipboard is not available");
+                }
+                _open = true;
+                _lastSynthHeartbeatTicks = NowTicks();
+                // Zero means "never read": the first poll must inspect whatever
+                // the loader or the master left on the clipboard, including a
+                // packet written before this agent opened.
+                _lastClipboardSeqNo = 0;
+            }
+        }
+
+        public bool IsOpen
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return _open;
+                }
+            }
+        }
+
+        /// <summary>
+        /// One bounded poll cycle: consume a master packet when the clipboard
+        /// sequence number moved, re-assert an unacknowledged packet that was
+        /// overwritten, flush pending outbound lines and hand back buffered
+        /// frame bytes. A synthetic heartbeat keeps AgentLink alive when the
+        /// clipboard stays quiet. The gate is released between steps so the
+        /// writer thread never waits on a poll sleep.
+        /// </summary>
+        public int Read(byte[] buffer, int offset, int count)
+        {
+            long deadline = NowTicks() + TicksFromMs(ReadPollMs);
+            while (true)
+            {
+                int copied;
+                lock (_gate)
+                {
+                    if (!_open)
+                    {
+                        throw new LinkLostException(0, "the transport is closed");
+                    }
+                    copied = DrainRx(buffer, offset, count);
+                    if (copied == 0)
+                    {
+                        PollClipboard();
+                        FlushOutbound();
+                        copied = DrainRx(buffer, offset, count);
+                    }
+                    if (copied == 0
+                        && ElapsedMs(_lastSynthHeartbeatTicks) >= SynthHeartbeatMs)
+                    {
+                        EnqueueSynthHeartbeat();
+                        copied = DrainRx(buffer, offset, count);
+                    }
+                    if (copied > 0)
+                    {
+                        _lastSynthHeartbeatTicks = NowTicks();
+                        return copied;
+                    }
+                }
+                if (NowTicks() >= deadline)
+                {
+                    return 0;
+                }
+                Thread.Sleep(ReadStepMs);
+            }
+        }
+
+        /// <summary>
+        /// Buffers one encoded frame until its newline arrives. The clipboard
+        /// write itself happens in Read, so the writer thread never blocks on
+        /// an externally owned clipboard.
+        /// </summary>
+        public void Write(byte[] buffer, int offset, int count)
+        {
+            lock (_gate)
+            {
+                if (!_open)
+                {
+                    throw new LinkLostException(0, "the transport is closed");
+                }
+                int end = offset + count;
+                for (int position = offset; position < end; position++)
+                {
+                    byte value = buffer[position];
+                    if (value == 0x0A)
+                    {
+                        string line = Encoding.UTF8.GetString(_txPartial.ToArray());
+                        _txPartial.SetLength(0);
+                        if (line.Length == 0 || IsIdleHeartbeat(line))
+                        {
+                            continue;
+                        }
+                        _txLines.Add(line);
+                        continue;
+                    }
+                    _txPartial.WriteByte(value);
+                    if (_txPartial.Length > MaxPartialBytes)
+                    {
+                        // The wire never splits a line past the frame bound; a
+                        // runaway partial is a protocol violation, not a frame.
+                        _txPartial.SetLength(0);
+                    }
+                }
+            }
+        }
+
+        public void Dispose()
+        {
+            lock (_gate)
+            {
+                _open = false;
+                _txLines.Clear();
+                _txPartial.SetLength(0);
+                _rxBuffer.SetLength(0);
+                _ackNeeded = false;
+                _inflightS2mSeq = 0;
+                _inflightPacketText = null;
+                _inflightAttempts = 0;
+            }
+        }
+
+        private void PollClipboard()
+        {
+            uint sequence = NativeMethods.GetClipboardSequenceNumber();
+            bool reassertDue = _inflightS2mSeq != 0
+                && ElapsedMs(_inflightSentTicks) >= ReassertMs;
+            if (sequence == _lastClipboardSeqNo && !reassertDue)
+            {
+                return;
+            }
+            string text;
+            if (!TryReadClipboard(out text))
+            {
+                // The clipboard is held by another process; retry next poll.
+                return;
+            }
+            _lastClipboardSeqNo = sequence;
+            ConsumeMasterPacket(text);
+            if (!reassertDue || _inflightS2mSeq == 0)
+            {
+                return;
+            }
+            if (string.Equals(text ?? string.Empty, _inflightPacketText,
+                              StringComparison.Ordinal))
+            {
+                return;
+            }
+            if (_inflightAttempts >= MaxReasserts)
+            {
+                // The peer stopped consuming packets: give the block back to
+                // AgentLink (its own ACK timeout retries the frame) instead of
+                // overwriting the user clipboard forever.
+                _inflightS2mSeq = 0;
+                _inflightPacketText = null;
+                _inflightAttempts = 0;
+                return;
+            }
+            if (TryWriteClipboard(_inflightPacketText))
+            {
+                _inflightAttempts++;
+                _inflightSentTicks = NowTicks();
+                _lastClipboardSeqNo = NativeMethods.GetClipboardSequenceNumber();
+            }
+        }
+
+        private void ConsumeMasterPacket(string text)
+        {
+            if (string.IsNullOrEmpty(text))
+            {
+                return;
+            }
+            string prefix = "TITELLA_M2S:" + _linkId + ":";
+            if (!text.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                // User content or another link's traffic; ours never starts
+                // with M2S, so nothing to consume.
+                return;
+            }
+            int headerEnd = text.IndexOf('\n');
+            if (headerEnd < 0)
+            {
+                return;
+            }
+            string header = text.Substring(0, headerEnd).TrimEnd('\r');
+            string[] parts = header.Split(':');
+            if (parts.Length != 4)
+            {
+                return;
+            }
+            long m2sSeq;
+            long ackS2m;
+            if (!long.TryParse(parts[2], NumberStyles.Integer,
+                               CultureInfo.InvariantCulture, out m2sSeq) ||
+                !long.TryParse(parts[3], NumberStyles.Integer,
+                               CultureInfo.InvariantCulture, out ackS2m))
+            {
+                return;
+            }
+            if (_inflightS2mSeq != 0 && ackS2m >= _inflightS2mSeq)
+            {
+                _inflightS2mSeq = 0;
+                _inflightPacketText = null;
+                _inflightAttempts = 0;
+            }
+            if (m2sSeq > _lastSeenM2sSeq)
+            {
+                _lastSeenM2sSeq = m2sSeq;
+                AppendRxLines(headerEnd + 1 < text.Length
+                    ? text.Substring(headerEnd + 1)
+                    : string.Empty);
+                _ackNeeded = true;
+                _ackNeededTicks = NowTicks();
+                return;
+            }
+            if (m2sSeq == _lastSeenM2sSeq && m2sSeq > 0)
+            {
+                // A re-asserted duplicate: its payload is already buffered, but
+                // the peer still needs the acknowledgement it missed.
+                _ackNeeded = true;
+                _ackNeededTicks = NowTicks();
+            }
+        }
+
+        private void AppendRxLines(string body)
+        {
+            if (body.Length == 0)
+            {
+                return;
+            }
+            string[] lines = body.Split('\n');
+            foreach (string raw in lines)
+            {
+                // A clipboard sync layer may normalize LF to CRLF.
+                string line = raw.TrimEnd('\r');
+                if (line.Length == 0)
+                {
+                    continue;
+                }
+                byte[] bytes = Encoding.UTF8.GetBytes(line + "\n");
+                if (bytes.Length > WireConstants.FrameBufferBytes)
+                {
+                    continue;
+                }
+                _rxBuffer.Write(bytes, 0, bytes.Length);
+            }
+        }
+
+        private void FlushOutbound()
+        {
+            if (!_open || _inflightS2mSeq != 0)
+            {
+                return;
+            }
+            if (_txLines.Count > 0)
+            {
+                int take = Math.Min(MaxPacketLines, _txLines.Count);
+                long sequence = _nextS2mSeq;
+                StringBuilder packet = new StringBuilder();
+                packet.Append("TITELLA_S2M:").Append(_linkId).Append(':')
+                    .Append(sequence).Append(':').Append(_lastSeenM2sSeq)
+                    .Append('\n');
+                for (int index = 0; index < take; index++)
+                {
+                    packet.Append(_txLines[index]).Append('\n');
+                }
+                string text = packet.ToString();
+                if (!TryWriteClipboard(text))
+                {
+                    return; // clipboard busy; the next poll retries
+                }
+                _txLines.RemoveRange(0, take);
+                _nextS2mSeq = sequence + 1;
+                _inflightS2mSeq = sequence;
+                _inflightPacketText = text;
+                _inflightSentTicks = NowTicks();
+                _inflightAttempts = 0;
+                // The packet header already carries the acknowledgement.
+                _ackNeeded = false;
+                _lastClipboardSeqNo = NativeMethods.GetClipboardSequenceNumber();
+                return;
+            }
+            if (_ackNeeded && ElapsedMs(_ackNeededTicks) >= AckDelayMs)
+            {
+                // Delay the pure acknowledgement briefly so responses produced
+                // by the dispatch thread ride the same packet.
+                StringBuilder packet = new StringBuilder();
+                packet.Append("TITELLA_S2M:").Append(_linkId).Append(":0:")
+                    .Append(_lastSeenM2sSeq).Append('\n');
+                if (TryWriteClipboard(packet.ToString()))
+                {
+                    _ackNeeded = false;
+                    _lastClipboardSeqNo = NativeMethods.GetClipboardSequenceNumber();
+                }
+            }
+        }
+
+        private void EnqueueSynthHeartbeat()
+        {
+            _lastSynthHeartbeatTicks = NowTicks();
+            string line = "{\"v\":1,\"channel\":\"control\",\"type\":\"heartbeat\","
+                + "\"link_id\":\"" + _linkId + "\"}";
+            byte[] bytes = Encoding.UTF8.GetBytes(line + "\n");
+            _rxBuffer.Write(bytes, 0, bytes.Length);
+        }
+
+        private int DrainRx(byte[] buffer, int offset, int count)
+        {
+            if (_rxBuffer.Position >= _rxBuffer.Length)
+            {
+                return 0;
+            }
+            int available = (int)(_rxBuffer.Length - _rxBuffer.Position);
+            int take = Math.Min(count, available);
+            _rxBuffer.Read(buffer, offset, take);
+            if (_rxBuffer.Position >= _rxBuffer.Length)
+            {
+                _rxBuffer.SetLength(0);
+                _rxBuffer.Position = 0;
+            }
+            return take;
+        }
+
+        private bool TryReadClipboard(out string text)
+        {
+            text = null;
+            long deadline = NowTicks() + TicksFromMs(OpenBudgetMs);
+            while (true)
+            {
+                if (!NativeMethods.OpenClipboard(IntPtr.Zero))
+                {
+                    if (NowTicks() < deadline)
+                    {
+                        Thread.Sleep(ClipboardRetryMs);
+                        continue;
+                    }
+                    return false;
+                }
+                try
+                {
+                    if (!NativeMethods.IsClipboardFormatAvailable(
+                            Win32Constants.CF_UNICODETEXT))
+                    {
+                        return true;
+                    }
+                    IntPtr handle = NativeMethods.GetClipboardData(
+                        Win32Constants.CF_UNICODETEXT);
+                    if (handle == IntPtr.Zero)
+                    {
+                        return true;
+                    }
+                    IntPtr locked = NativeMethods.GlobalLock(handle);
+                    if (locked == IntPtr.Zero)
+                    {
+                        return false;
+                    }
+                    try
+                    {
+                        long bytes = (long)NativeMethods.GlobalSize(handle).ToUInt64();
+                        if (bytes < 2)
+                        {
+                            text = string.Empty;
+                            return true;
+                        }
+                        if (bytes > MaxClipboardTextBytes)
+                        {
+                            bytes = MaxClipboardTextBytes;
+                        }
+                        string raw = Marshal.PtrToStringUni(locked, (int)(bytes / 2));
+                        int terminator = raw.IndexOf('\0');
+                        text = terminator >= 0 ? raw.Substring(0, terminator) : raw;
+                        return true;
+                    }
+                    finally
+                    {
+                        NativeMethods.GlobalUnlock(handle);
+                    }
+                }
+                finally
+                {
+                    NativeMethods.CloseClipboard();
+                }
+            }
+        }
+
+        private bool TryWriteClipboard(string text)
+        {
+            if (text == null)
+            {
+                return false;
+            }
+            long deadline = NowTicks() + TicksFromMs(OpenBudgetMs);
+            while (true)
+            {
+                if (!NativeMethods.OpenClipboard(IntPtr.Zero))
+                {
+                    if (NowTicks() < deadline)
+                    {
+                        Thread.Sleep(ClipboardRetryMs);
+                        continue;
+                    }
+                    return false;
+                }
+                try
+                {
+                    if (!NativeMethods.EmptyClipboard())
+                    {
+                        return false;
+                    }
+                    if (!SetClipboardString(text))
+                    {
+                        return false;
+                    }
+                    if (_excludeFormat != 0)
+                    {
+                        SetClipboardDword(_excludeFormat);
+                    }
+                    if (_historyFormat != 0)
+                    {
+                        SetClipboardDword(_historyFormat);
+                    }
+                    return true;
+                }
+                finally
+                {
+                    NativeMethods.CloseClipboard();
+                }
+            }
+        }
+
+        private static bool SetClipboardString(string text)
+        {
+            int bytes = (text.Length + 1) * 2;
+            IntPtr memory = NativeMethods.GlobalAlloc(
+                Win32Constants.GMEM_MOVEABLE, (UIntPtr)(uint)bytes);
+            if (memory == IntPtr.Zero)
+            {
+                return false;
+            }
+            IntPtr locked = NativeMethods.GlobalLock(memory);
+            if (locked == IntPtr.Zero)
+            {
+                NativeMethods.GlobalFree(memory);
+                return false;
+            }
+            try
+            {
+                char[] chars = text.ToCharArray();
+                Marshal.Copy(chars, 0, locked, chars.Length);
+                Marshal.WriteInt16(locked, chars.Length * 2, 0);
+            }
+            finally
+            {
+                NativeMethods.GlobalUnlock(memory);
+            }
+            if (NativeMethods.SetClipboardData(Win32Constants.CF_UNICODETEXT, memory)
+                == IntPtr.Zero)
+            {
+                NativeMethods.GlobalFree(memory);
+                return false;
+            }
+            // Ownership transferred to the clipboard on success: never free.
+            return true;
+        }
+
+        private static bool SetClipboardDword(uint format)
+        {
+            // GMEM_ZEROINIT supplies the four zero bytes; presence of the
+            // format is what monitors read, and a zero DWORD for
+            // CanIncludeInClipboardHistory means "do not include".
+            IntPtr memory = NativeMethods.GlobalAlloc(
+                Win32Constants.GMEM_MOVEABLE | Win32Constants.GMEM_ZEROINIT, (UIntPtr)4u);
+            if (memory == IntPtr.Zero)
+            {
+                return false;
+            }
+            if (NativeMethods.SetClipboardData(format, memory) == IntPtr.Zero)
+            {
+                NativeMethods.GlobalFree(memory);
+                return false;
+            }
+            return true;
+        }
+
+        private static uint SafeRegisterFormat(string name)
+        {
+            try
+            {
+                return NativeMethods.RegisterClipboardFormatW(name);
+            }
+            catch (Exception)
+            {
+                return 0;
+            }
+        }
+
+        private static bool ClipboardReachable(int budgetMs)
+        {
+            long deadline = NowTicks() + TicksFromMs(budgetMs);
+            while (true)
+            {
+                if (NativeMethods.OpenClipboard(IntPtr.Zero))
+                {
+                    NativeMethods.CloseClipboard();
+                    return true;
+                }
+                if (NowTicks() >= deadline)
+                {
+                    return false;
+                }
+                Thread.Sleep(ClipboardRetryMs);
+            }
+        }
+
+        /// <summary>
+        /// Exactly the AgentLink idle heartbeat. Everything else, including a
+        /// payload string that happens to mention a heartbeat, is real
+        /// traffic: a JSON string escapes its quotes, so this pair of
+        /// substrings can only appear as actual frame fields.
+        /// </summary>
+        private static bool IsIdleHeartbeat(string line)
+        {
+            return line.IndexOf("\"channel\":\"control\"", StringComparison.Ordinal) >= 0
+                && line.IndexOf("\"type\":\"heartbeat\"", StringComparison.Ordinal) >= 0;
+        }
+
+        private static long NowTicks()
+        {
+            return Stopwatch.GetTimestamp();
+        }
+
+        private static long TicksFromMs(long milliseconds)
+        {
+            return (long)(milliseconds / 1000.0 * Stopwatch.Frequency);
+        }
+
+        private static long ElapsedMs(long sinceTicks)
+        {
+            return (long)((NowTicks() - sinceTicks) * 1000.0 / Stopwatch.Frequency);
         }
     }
 

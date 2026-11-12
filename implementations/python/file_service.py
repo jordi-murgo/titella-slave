@@ -11,6 +11,14 @@ import stat
 import tempfile
 from pathlib import Path
 
+# The zipapp loads these modules flat (wire.py, screen_service.py next to it),
+# while the repository tests import them under implementations.python. Both
+# layouts must resolve the same module.
+try:
+    from screen_service import ScreenCaptureError
+except ImportError:  # pragma: no cover - repository layout only
+    from .screen_service import ScreenCaptureError
+
 MAX_READ_BYTES = 64 * 1024
 DEFAULT_READ_BYTES = 32 * 1024
 MAX_WRITE_BYTES = 64 * 1024
@@ -28,6 +36,11 @@ class FileServiceError(RuntimeError):
 
 
 class FileService(object):
+    def __init__(self):
+        # The capture backend is created on first use: importing the module
+        # must not probe the graphical session.
+        self._screen = None
+
     def _path(self, value):
         if not isinstance(value, str) or not value:
             raise FileServiceError("invalid_path", "path is mandatory")
@@ -224,4 +237,21 @@ class FileService(object):
             return self.find(body.get("path"), body.get("pattern"), body.get("limit", MAX_FIND_RESULTS)), None
         if op == "sysinfo":
             return self.sysinfo(), None
+        if op == "screen":
+            return self.screen()
         raise FileServiceError("unknown_op", "unknown fs operation")
+
+    def screen(self):
+        """One PNG of the local graphical session; the payload carries bytes."""
+        if self._screen is None:
+            try:
+                from screen_service import ScreenService
+            except ImportError:  # pragma: no cover - repository layout only
+                from .screen_service import ScreenService
+
+            self._screen = ScreenService()
+        try:
+            metadata, image = self._screen.capture()
+        except ScreenCaptureError as exc:
+            raise FileServiceError(exc.code, exc.message)
+        return metadata, image

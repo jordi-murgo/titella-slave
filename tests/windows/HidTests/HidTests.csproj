@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Contract tests of the HID data transport. The .NET SDK is a local
+       test tool only: the product source stays C# 5 on the .NET Framework,
+       so LangVersion is pinned to 5 and no NuGet package is referenced. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>5</LangVersion>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <AssemblyName>HidTests</AssemblyName>
+    <RootNamespace>Titella.Slave.Tests</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="../../../implementations/windows/HidByteStream.cs" />
+    <Compile Include="../HidProtocolTests.cs" />
+    <Compile Include="Program.cs" />
+  </ItemGroup>
+
+</Project>

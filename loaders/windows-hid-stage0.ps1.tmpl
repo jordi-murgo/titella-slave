@@ -1,0 +1,106 @@
+# Titella USB-only stage-0 loader, typed as one gzip+base64 line: it pulls
+# the #@# container (loader + HidByteStream unit) from the Feature 0x11
+# snapshot, compiles the unit from a temp file and runs the loader part.
+$ErrorActionPreference = 'Stop'
+$dl = [DateTime]::UtcNow.AddSeconds(30)
+$tok = '__HID_TOKEN__'
+$size = __HID_SIZE__
+$sha = '__HID_SHA256__'
+if (-not ('Titella.HW' -as [type])) {
+  Add-Type -Name HW -Namespace Titella -MemberDefinition '
+[DllImport("hid.dll")] public static extern void HidD_GetHidGuid(out Guid g);
+[DllImport("setupapi.dll", CharSet=CharSet.Unicode)] public static extern IntPtr SetupDiGetClassDevsW(ref Guid g, IntPtr e, IntPtr w, uint f);
+[DllImport("setupapi.dll", CharSet=CharSet.Unicode)] public static extern bool SetupDiEnumDeviceInterfaces(IntPtr s, IntPtr d, ref Guid g, uint i, [In, Out] byte[] o);
+[DllImport("setupapi.dll", CharSet=CharSet.Unicode)] public static extern bool SetupDiGetDeviceInterfaceDetailW(IntPtr s, [In, Out] byte[] d, IntPtr b, uint n, out uint r, IntPtr z);
+[DllImport("setupapi.dll", CharSet=CharSet.Unicode)] public static extern bool SetupDiDestroyDeviceInfoList(IntPtr s);
+[DllImport("kernel32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr CreateFileW(string p, uint a, uint sh, IntPtr z, uint di, uint fl, IntPtr t);
+[DllImport("kernel32.dll", CharSet=CharSet.Unicode)] public static extern bool CloseHandle(IntPtr h);
+[DllImport("hid.dll")] public static extern bool HidD_GetFeature(IntPtr h, [In, Out] byte[] b, uint n);
+[DllImport("hid.dll")] public static extern bool HidD_SetFeature(IntPtr h, [In] byte[] b, uint n);
+public static string[] Paths() {
+ Guid g; HidD_GetHidGuid(out g);
+ IntPtr s = SetupDiGetClassDevsW(ref g, IntPtr.Zero, IntPtr.Zero, 0x12);
+ if (s.ToInt64() == -1) { return new string[0]; }
+ System.Collections.Generic.List<string> r = new System.Collections.Generic.List<string>();
+ try {
+  byte[] d = new byte[64];
+  BitConverter.GetBytes(IntPtr.Size == 8 ? 32 : 28).CopyTo(d, 0);
+  for (uint i = 0; ; i++) {
+   if (!SetupDiEnumDeviceInterfaces(s, IntPtr.Zero, ref g, i, d)) { break; }
+   IntPtr b = Marshal.AllocHGlobal(1024); uint n;
+   try {
+    Marshal.WriteInt32(b, IntPtr.Size == 8 ? 8 : 6);
+    if (!SetupDiGetDeviceInterfaceDetailW(s, d, b, 1024, out n, IntPtr.Zero)) { continue; }
+    string p = Marshal.PtrToStringUni(new IntPtr(b.ToInt64() + 4));
+    if (p.IndexOf("vid_17ef", StringComparison.OrdinalIgnoreCase) >= 0 && p.IndexOf("pid_a38f", StringComparison.OrdinalIgnoreCase) >= 0) { r.Add(p); }
+   } finally { Marshal.FreeHGlobal(b); }
+  }
+ } finally { SetupDiDestroyDeviceInfoList(s); }
+ return r.ToArray();
+}'
+}
+function Tx($a) { ([BitConverter]::ToString($a, 4, 8) -replace '-', '') }
+$dev = [IntPtr]::Zero; $n = 0
+try {
+  $m = New-Object byte[] 64
+  foreach ($p in [Titella.HW]::Paths()) {
+    $h = [IntPtr]::Zero
+    try {
+      $h = [Titella.HW]::CreateFileW($p, [uint32]3221225472, 3, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero)
+      if ($h.ToInt64() -eq -1) { continue }
+      $m[0] = 0x11
+      if (-not [Titella.HW]::HidD_GetFeature($h, $m, 64)) { continue }
+      if ($m[0] -ne 0x11 -or $m[1] -ne 1 -or $m[2] -ne 1 -or $m[3] -ne 0) { continue }
+      if ((Tx $m) -cne $tok -or [BitConverter]::ToUInt32($m, 16) -ne $size) { continue }
+      $n++
+      if ($n -eq 1) { $dev = $h; $h = [IntPtr]::Zero }
+    } finally { if ($h.ToInt64() -gt 0) { [void][Titella.HW]::CloseHandle($h) } }
+  }
+  if ($n -eq 0) { throw 'not_found' }
+  if ($n -gt 1) { throw 'ambiguous' }
+  $buf = New-Object byte[] $size
+  $sel = New-Object byte[] 64; $sel[0] = 0x11; $sel[1] = 1; $sel[2] = 1
+  $tb = New-Object byte[] 8
+  foreach ($i in 0..7) { $tb[$i] = [Convert]::ToByte($tok.Substring($i * 2, 2), 16) }
+  [Array]::Copy($tb, 0, $sel, 4, 8)
+  $o = New-Object byte[] 64; $o[0] = 0x11
+  $off = 0
+  while ($off -lt $size) {
+    [BitConverter]::GetBytes([uint32]$off).CopyTo($sel, 12)
+    $len = 0
+    for ($t = 0; $t -lt 4 -and !$len; $t++) {
+      if ([DateTime]::UtcNow -ge $dl) { throw 'timeout' }
+      if (-not [Titella.HW]::HidD_SetFeature($dev, $sel, 64)) { continue }
+      if (-not [Titella.HW]::HidD_GetFeature($dev, $o, 64)) { continue }
+      if ($o[0] -ne 0x11 -or $o[1] -ne 1 -or $o[2] -ne 2) { continue }
+      if ((Tx $o) -cne $tok -or [BitConverter]::ToUInt32($o, 12) -ne [uint32]$off -or [BitConverter]::ToUInt32($o, 16) -ne $size) { continue }
+      $x = [Math]::Min(44, $size - $off)
+      if ($o[3] -ne $x) { continue }
+      [Array]::Copy($o, 20, $buf, $off, $x)
+      $len = $x
+    }
+    if (!$len) { throw 'failed' }
+    $off += $len
+  }
+  $c = [Security.Cryptography.SHA256]::Create()
+  try { $hex = ([BitConverter]::ToString($c.ComputeHash($buf)) -replace '-', '').ToLowerInvariant() }
+  finally { $c.Dispose() }
+  if ($hex -cne $sha) { throw 'checksum' }
+} finally {
+  if ($dev.ToInt64() -gt 0) { [void][Titella.HW]::CloseHandle($dev) }
+}
+$ms = [IO.MemoryStream]::new($buf)
+$rd = New-Object IO.StreamReader ([IO.Compression.GzipStream]::new($ms, ([IO.Compression.CompressionMode]::Decompress)))
+try { $src = $rd.ReadToEnd() } finally { $rd.Dispose(); $ms.Dispose() }
+$i = $src.IndexOf('#@#')
+if ($i -lt 0) { throw 'no_marker' }
+$unit = $src.Substring($i + 3)
+$src = $src.Substring(0, $i)
+$f = Join-Path ([IO.Path]::GetTempPath()) ($tok + '.cs')
+try {
+  [IO.File]::WriteAllText($f, $unit, [Text.Encoding]::UTF8)
+  if (-not ('Titella.Slave.HidByteStream' -as [type])) {
+    Add-Type -LiteralPath $f -ReferencedAssemblies System.dll,System.Core.dll -IgnoreWarnings
+  }
+} finally { Remove-Item -LiteralPath $f -ErrorAction SilentlyContinue }
+. ([ScriptBlock]::Create($src))

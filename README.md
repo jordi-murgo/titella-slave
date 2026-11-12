@@ -20,8 +20,12 @@ deletes its own payload and bootstrap directory when the session ends.
 - `src/titella_slave_assets/bundles.py` — `load_bundle()` validation of the
   packaged artifacts against their manifest.
 - `build_support.py` — deterministic generation of `titella-slave.pyz`,
-  `titella-slave.cs`, both loaders and `manifest.json` into
-  `build_lib/titella_slave_assets/_data/` via the setuptools `build_py` hook.
+  `titella-slave.cs`, both loaders, the Windows HID bootstrap artifacts
+  (`windows-hid-stage0.ps1.tmpl`, `windows-hid-transport.cs`) and
+  `manifest.json` into `build_lib/titella_slave_assets/_data/` via the
+  setuptools `build_py` hook. `windows-hid-transport.cs` is a byte copy of
+  the sole `implementations/windows/HidByteStream.cs`; no second source copy
+  exists.
 - `loaders/python.py.tmpl` — loader typed over HID on the target; it locates the
   CDC, receives the payload with per-block ACK, checks size and SHA-256 and
   starts the zipapp.
@@ -49,10 +53,11 @@ wheel; their canonical source stays in `docs/` here and in the sdist.
 python3 -m build --outdir dist
 ```
 
-The wheel `titella-slave-assets==1.0.0` is stdlib-only: no runtime
+The wheel `titella-slave-assets==1.1.0` is stdlib-only: no runtime
 dependencies and `Requires-Python >=3.9`. Payloads are byte-reproducible;
-the manifest pins size and SHA-256 of every artifact, and `load_bundle()`
-re-validates them at load time.
+the manifest (schema 2) pins size and SHA-256 of every artifact, including
+the Windows `hid_bootstrap` block, and `load_bundle()` re-validates them at
+load time.
 
 ## Tests
 

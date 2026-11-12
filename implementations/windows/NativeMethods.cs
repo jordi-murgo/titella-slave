@@ -20,7 +20,7 @@ namespace Titella.Slave
         public const uint INVALID_ERROR = 0xFFFFFFFFu;
 
         // Serial
-        public const uint CBR_115200 = 115200u;
+        public const uint CBR_2000000 = 2000000u;
         public const uint NOPARITY = 0u;
         public const byte ONESTOPBIT = 0;
         public const uint MAXDWORD = 0xFFFFFFFFu;
@@ -66,6 +66,20 @@ namespace Titella.Slave
         public const uint INVALID_FILE_ATTRIBUTES = 0xFFFFFFFFu;
         public const uint FILE_ATTRIBUTE_DIRECTORY = 0x00000010u;
         public const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400u;
+
+        // Screen capture (GetSystemMetrics)
+        public const int SM_CXSCREEN = 0;
+        public const int SM_CYSCREEN = 1;
+
+        // Clipboard: CF_UNICODETEXT payloads carried over GMEM_MOVEABLE
+        // global allocations, the only form SetClipboardData accepts.
+        public const uint CF_UNICODETEXT = 13u;
+        public const uint GMEM_MOVEABLE = 0x0002u;
+        public const uint GMEM_ZEROINIT = 0x0040u;
+
+        // DPI awareness context (IntPtr is not a legal const type in C#;
+        // PER_MONITOR_AWARE_V2 is the documented (HANDLE)-4).
+        public static readonly IntPtr DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (IntPtr)(-4);
     }
 
     /// <summary>Native structures. All layout-critical; keep Pack defaults.</summary>
@@ -75,7 +89,7 @@ namespace Titella.Slave
         internal struct DCB
         {
             public uint DCBlength;      // sizeof(DCB)
-            public uint BaudRate;       // CBR_115200
+            public uint BaudRate;       // CBR_2000000
             public uint Flags;          // bitfield dword; fBinary must be set
             public ushort wReserved;
             public ushort XonLim;
@@ -339,6 +353,58 @@ namespace Titella.Slave
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         internal static extern bool DeleteFileW(string lpFileName);
+
+        // ---- Desktop -----------------------------------------------------------
+
+        // Returns the previous context; NULL means the requested one was not
+        // applied. Available since Windows 10 1809.
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
+
+        [DllImport("user32.dll")]
+        internal static extern int GetSystemMetrics(int nIndex);
+
+        // ---- Clipboard ---------------------------------------------------------
+
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern bool OpenClipboard(IntPtr hWndNewOwner);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern bool CloseClipboard();
+
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern bool EmptyClipboard();
+
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern bool IsClipboardFormatAvailable(uint format);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern IntPtr GetClipboardData(uint uFormat);
+
+        // On success the system owns hMem; the caller must not free it.
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern IntPtr SetClipboardData(uint uFormat, IntPtr hMem);
+
+        [DllImport("user32.dll")]
+        internal static extern uint GetClipboardSequenceNumber();
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        internal static extern uint RegisterClipboardFormatW(string lpszFormat);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern IntPtr GlobalAlloc(uint uFlags, UIntPtr dwBytes);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern IntPtr GlobalLock(IntPtr hMem);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern bool GlobalUnlock(IntPtr hMem);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern IntPtr GlobalFree(IntPtr hMem);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern UIntPtr GlobalSize(IntPtr hMem);
     }
 
     /// <summary>

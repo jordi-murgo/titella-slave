@@ -1,12 +1,12 @@
 // In-process PowerShell engine host for one-shot jobs.
 //
-// A job is still a child powershell.exe assigned to a job object (so
-// cancellation and timeouts keep killing the whole process tree), but the
-// user script never touches the child's command line. The command line only
-// says: load the agent assembly and run the in-process Runspace; the script
-// itself arrives on stdin and executes in a custom PSHost, which keeps the
-// script text out of every classic PowerShell log channel (Id 400/800
-// HostApplication, 4103/4104 script text, PSReadLine history).
+// A job is the agent executable itself started with --job and assigned to a
+// job object (so cancellation and timeouts keep killing the whole process
+// tree), but the user script never touches the child's command line. The
+// command line only says --job; the script itself arrives on stdin and
+// executes in a custom PSHost, which keeps the script text out of every
+// classic PowerShell log channel (Id 400/800 HostApplication, 4103/4104
+// script text, PSReadLine history).
 
 namespace Titella.Slave
 {
@@ -320,8 +320,7 @@ namespace Titella.Slave
     }
 
     /// <summary>
-    /// Child-process entry point. The job command line ends with
-    /// [Titella.Slave.JobEntry]::Run(): read the script from stdin (the
+    /// Child-process entry point (--job): read the script from stdin (the
     /// parent closes its end after writing, which is the EOF signal) and
     /// execute it in the in-process Runspace, mapping the exit code to
     /// the process exit code exactly like powershell.exe -Command does.

@@ -2,9 +2,18 @@
 
 ## Scope and trust model
 
-The ESP32-S3 exposes two master ports with the same protocol: **UART0** (`Serial0`) and, if the firmware is compiled with `-DTITELLA_WIFI_PASSPHRASE`, a **TCP client over a WPA2 SoftAP**. The native USB CDC connects the ESP32-S3 to the slave machine (macOS, Linux or Windows). The firmware executes the `hid` channel received through any master port locally and forwards the other channels without transforming the line.
+The ESP32-S3 exposes two master ports with the same protocol: **UART0** (`Serial0`) and, if the firmware is compiled with `-DTITELLA_WIFI_PASSPHRASE`, a **TCP client over a WPA2 SoftAP**. The native USB CDC connects the ESP32-S3 to the slave machine (macOS, Linux or Windows). The firmware executes the `hid` and `video` channels received through any master port locally and forwards the other channels without transforming the line. `video` stages the static frame of the emulated UVC camera described in the firmware README.
 
-The UART speed is configurable and is not part of the framing: the firmware sets it with `TITELLA_UART_BAUD` (115200 by default, `Serial0.begin()`) and the master with `TITELLA_SERIAL_BAUD`. Both ends must match. `hid.health` answers `firmware`, `protocol`, `uart_baud` and `wifi`, so the master can prove what was flashed. `SerialLink` uses the platform's termios constant when it exists and, on macOS, applies non-traditional speeds with `IOSSIOSPEED` after configuring termios; on other platforms a speed without a constant is rejected and the port does not open.
+The UART speed is fixed by the build rather than discovered: the firmware sets it with `TITELLA_UART_BAUD` (2,000,000 baud by default and in `build_opt.h`, `Serial0.begin()`) and the master with `TITELLA_SERIAL_BAUD`, which also defaults to 2,000,000. Both ends must match; 115200 was the historical default and a mismatch garbles every frame. `hid.health` answers `firmware`, `protocol`, `uart_baud`, `wifi`, `slave_transports`, the active `slave_transport`, `hid_data_protocol`, `usb_vid`, `usb_pid`, `usb_serial` and `slave_connected`, so the master can prove what was flashed, whether the HID data transport exists, and whether the destination it forwards to right now still has a stream attached. `slave_connected` is read-only state of the selected destination: `HidPort.connected()` for the HID data endpoint, or `CdcPort.connected()` for the CDC. The core's `USBCDC::operator bool` returns its `connected` flag, which `_onLineState` sets when the host asserts `DTR && RTS` and clears when `DTR` drops — so the CDC value tracks the host's open line, not mere enumeration. The stop path proves a closed stream with it instead of inferring one from a failed RPC. `SerialLink` uses the platform's termios constant when it exists and, on macOS, applies non-traditional speeds with `IOSSIOSPEED` after configuring termios; on other platforms a speed without a constant is rejected and the port does not open.
+
+## Slave data transport (`slave_transport = "cdc" | "hid"`)
+
+The master→ESP32 link and the ESP32→slave leg are separate selections. `slave_transport` names the second one:
+
+- `cdc` (default) forwards the protocol v1 frames to the native USB CDC the slave opens; this is the path every earlier firmware carries.
+- `hid` forwards the same frames to the vendor-defined HID data collection (reports `0x10`/`0x11`). It needs `transport=serial`, `agent_protocol=serial`, `slave_platform=windows` and no `slave_cdc_port`, and only firmware 1.6.0 or newer advertises it (`hid_data_protocol: 1`). The bootstrap stages the compressed loader in the Feature `0x11` mailbox over the UART and types only a bounded stage-0 line, so the target uses no COM port, no clipboard and no network. There is no automatic fallback: an old firmware answers `slave_transport_unsupported` before any keystroke.
+
+The selection is a local `hid.slave_transport` operation of the firmware (`{"transport":"cdc"|"hid"}`); it is refused with `slave_transport_busy` while frames are still queued, and only the selected destination is pumped. A new HID epoch, a close and a physical disconnect clear the selected destination's parser and queue so no byte of a previous session joins the next one.
 
 The link uses plaintext UTF-8 JSON by an explicit decision of physical trust. `link_id` correlates and allows resuming a short replug; **it does not authenticate or encrypt**. Any process with access to the CDC, the UART or the SoftAP network can observe or inject operations with the permissions of the slave user.
 
@@ -18,11 +27,50 @@ The link uses plaintext UTF-8 JSON by an explicit decision of physical trust. `l
 The SoftAP is a private network created by the ESP32-S3: SSID `TITELLA_WIFI_SSID` (`Titella` by default), WPA2 with `TITELLA_WIFI_PASSPHRASE` and address `192.168.4.1`. The server listens on `TITELLA_WIFI_TCP_PORT` (5555 by default). The master associates to that network and connects with `TITELLA_TRANSPORT=wifi`, `TITELLA_WIFI_HOST` and `TITELLA_WIFI_PORT`.
 
 - **Single TCP client.** A new connection replaces the previous one: the ESP32 cuts the previous client, discards whatever remained to be sent and accepts the new one. This is safer than refusing, because a dead client cannot block the only Wi-Fi port forever.
-- **Transport contract.** Both ports go through the same state machine: hid is executed locally and the rest is forwarded to the CDC. Direction rules and frame limits do not change.
+- **Transport contract.** Both ports go through the same state machine: hid and video are executed locally and the rest is forwarded to the CDC. Direction rules and frame limits do not change.
 - **Response routing.** Frames from the slave return to the master port whose `link_id` matches. If the master switches transports while keeping its `link_id`, the port with the most recent activity wins. If no port has claimed that `link_id` yet, the frame is delivered to all connected masters and each discards the ones not its own.
 - **Security.** The WPA2 passphrase is the network's access control; TCP adds no encryption or authentication of its own. `link_id` remains correlation, not a credential. Without the macro, or with a passphrase shorter than 8 characters, Wi-Fi stays disabled and behavior is identical to the UART-only version (`wifi.enabled=false`).
 - **Non-blocking.** Accepting connections and sending use `MSG_DONTWAIT`; what the socket does not accept accumulates in a bounded buffer that is drained on each router pass. A client that stops reading gets disconnected instead of holding back the HID `loop()`.
 - **Autodetection and modem lines.** They only exist on the serial transport. With `TITELLA_TRANSPORT=wifi` no `/dev/cu.*` is probed, termios is not applied and DTR/RTS are not released; on TCP the equivalent is the `connect` itself with backoff.
+
+## Clipboard CDC (`agent_protocol = "clipboard"`)
+
+A window rig has no CDC port of its own: the agent runs inside a remote desktop or
+an app window, so the master's clipboard is the only shared channel. Selecting
+`agent_protocol = "clipboard"` renders the sentinel `CLIPBOARD` where a port name
+would go; the loader and the agent then carry the same v1 frames inside clipboard
+packets instead of a serial byte stream.
+
+```
+master to slave:  TITELLA_M2S:<link_id>:<pkt_seq>:<ack_s2m_seq>\n<frame>\n<frame>...
+slave to master:  TITELLA_S2M:<link_id>:<pkt_seq>:<ack_m2s_seq>\n<frame>\n<frame>...
+```
+
+- `pkt_seq` starts at 1 and increases by one for every packet that carries at least
+  one frame. `ack_*` is the highest `pkt_seq` this side has consumed from the peer
+  (`0` before the first packet).
+- **Packets, not streams.** One packet carries up to 16 frame lines. A packet with
+  zero lines and `pkt_seq = 0` is a pure acknowledgement: it never needs an
+  acknowledgement of its own, which is what keeps the exchange from ping-ponging.
+- **Stop and wait.** A sender keeps at most one unacknowledged packet and re-asserts
+  it when another writer overwrites the clipboard before the peer reads it. After a
+  bounded number of re-assertions the packet is abandoned so the block-level ACK
+  logic above retries it; the user clipboard is never held hostage.
+- **Idle silence.** A quiet link writes nothing: the agent feeds its own grace clock a
+  synthetic local `control.heartbeat` every 2 s and drops the idle heartbeats it
+  would otherwise send, so neither side polls or rewrites the clipboard while idle.
+  `control.agent.stop` still stops the agent immediately.
+- **Clipboard history.** Packets written on Windows also carry the
+  `ExcludeClipboardContentFromMonitorProcessing` and
+  `CanIncludeInClipboardHistory` formats so clipboard managers and sync monitors
+  ignore them. On the master side the packet types
+  `org.nspasteboard.TransientType`, `org.nspasteboard.AutoGeneratedType` and
+  `org.nspasteboard.ConcealedType` play the same role.
+- **Tools.** The POSIX agent uses `pbcopy`/`pbpaste` on macOS, `wl-copy`/`wl-paste`
+  on Wayland and `xclip` on X11; a host with none of them reports
+  `clipboard_unavailable` instead of falling back to another channel.
+- **Line endings.** A clipboard sync layer may normalize LF to CRLF; each side trims
+  a trailing CR per line, so framing survives the hop unchanged.
 
 ## Framing and limits
 
@@ -40,7 +88,7 @@ All frames include:
 | Field | Type | Meaning |
 |---|---|---|
 | `v` | integer | Version; in this cut always `1`. |
-| `channel` | string | `hid`, `control`, `bootstrap`, `shell`, `fs` or `transfer`. |
+| `channel` | string | `hid`, `video`, `control`, `bootstrap`, `shell`, `fs` or `transfer`. |
 | `type` | string | `hello`, `heartbeat`, `request`, `response`, `data`, `ack`, `event` or `error`. |
 | `link_id` | string | 128 random bits represented with 32 hexadecimal characters. It is not a secret or a credential. |
 
@@ -75,6 +123,8 @@ Terminal chunk slave → master:
 |---|---|---|---|
 | Master (UART0 or TCP) | `hid` | `request` | Firmware; never forwarded to the CDC. |
 | Firmware | `hid` | `response`, `error` | Originating master port. |
+| Master (UART0 or TCP) | `video` | `request` | Firmware; never forwarded to the CDC. |
+| Firmware | `video` | `response`, `error` | Originating master port. |
 | Master (UART0 or TCP) | `control` | `heartbeat`, `request`, `ack` | Slave via CDC. |
 | Master (UART0 or TCP) | `bootstrap` | `request`, `data`, `ack` | Loader via CDC. |
 | Master (UART0 or TCP) | `shell`, `fs`, `transfer` | `request`, `data`, `ack` | Agent via CDC. |
@@ -82,7 +132,7 @@ Terminal chunk slave → master:
 | Slave | `bootstrap` | `response`, `ack`, `event`, `error` | Master with matching `link_id`. |
 | Slave | `shell`, `fs`, `transfer` | `response`, `data`, `ack`, `event`, `error` | Master with matching `link_id`. |
 
-The firmware rejects `channel=hid` received from the CDC and never calls the HID controller from that side. Unknown versions, channels, types or shapes produce an `error` on the originating port and are not forwarded.
+The firmware rejects `channel=hid` received from the CDC and never calls the HID controller from that side. It rejects `channel=video` from the CDC for the same reason: the camera image comes from the master, so a slave frame must not be able to overwrite the staged picture. Unknown versions, channels, types or shapes produce an `error` on the originating port and are not forwarded.
 
 ## Correlation, ACK and deduplication
 
@@ -100,6 +150,44 @@ File transfers (`transfer`) use a sliding window with per-block ACK:
 The receiver accepts only `seq == expected`: a gap is neither written nor acknowledged (the sender will resend it) and a block earlier than the expected one is acknowledged again without being rewritten. The deduplication key `(link_id, session_id, seq)` is registered only after accepting the frame; registering earlier would turn the resend of a rejected gap into a false ACK. An already-applied duplicate is acknowledged again, but its bytes are not applied again.
 
 The upload window is set by the master; the download window travels in the body of `download.begin` (`window`, 1–64, 8 by default) so that window 1 and 8 can be compared with the same binary.
+
+## Screen capture: `fs.screen`
+
+`fs.screen` is the only file operation that returns image bytes. Both slave implementations serve it: the Windows agent captures its own desktop, and the Python agent captures the graphical session it runs in. A backend that is unavailable — no Windows agent, no `screencapture`, no X11 tool, no portal — answers its own error code and the master never falls back to another capture path. It is an extension of the existing `fs` channel, not a protocol version change.
+
+Backends and what each one guarantees:
+
+| Backend | Selection | Failure that is reported, never faked |
+|---|---|---|
+| `windows-dotnet` | the Windows agent | `screen_capture_failed` with the real diagnostic |
+| `macos-screencapture` | macOS session | `screen_permission_denied` when Screen Recording is not granted: without it `screencapture` exits 1 with "could not create image from display", and the CoreGraphics preflight names the cause before the tool runs |
+| `x11-import` | `XDG_SESSION_TYPE=x11` and ImageMagick present | `screen_unsupported` naming the missing tool |
+| `x11-ffmpeg` | X11 with `ffmpeg` when `import` is absent | `screen_capture_failed` with ffmpeg's diagnostic |
+| `wayland-portal` | `XDG_SESSION_TYPE=wayland` | `screen_permission_denied` when the portal denies or cancels: a Wayland compositor has no global framebuffer, so the user is part of the capture |
+
+The `backend` field in the response metadata names the one that produced the frame. It is diagnostic only.
+
+Request:
+
+```json
+{"channel":"fs","type":"request","link_id":"<link>","request_id":42,"op":"screen","body":{"stream_id":"<generated id>"}}
+```
+
+Response metadata, followed by the ordinary `data` frames of the stream and the `fs.stream.finished` event:
+
+```json
+{"format":"png","width_px":2560,"height_px":1440,"bytes":214533,"source":"agent","monitor":"primary","stream_id":"<generated id>","payload_kind":"bytes"}
+```
+
+- The payload is one PNG of the agent's **primary monitor** at native resolution, origin `(0,0)`, with no base64 image inside the metadata.
+- The `backend` field is only present on implementations that have more than one capture path (the Python agent); a receiver must not require it.
+- Frames carry monotonically increasing `seq` and at most 512 decoded bytes each. `fs.screen` uses the **windowed** sender of the transfer channel (per-block ACK, bounded resends, several blocks in flight), not the stop-and-wait used by the other `fs` streams: measured on the rig, stop-and-wait sustains about 3.5 KiB/s against 30–45 KiB/s windowed, and a full-screen PNG is far too large for the former. The master therefore reassembles by `seq` and acknowledges every block, holding out-of-order ones until the hole is filled; the hold is bounded by the payload ceiling.
+- The final event reports `status:"finished"` and the transmitted byte count, which must equal `bytes` and the length of the PNG actually received. A shorter payload is a truncated transfer: the master rejects it as a retryable `screen_capture_failed` and publishes no image. Observed on the rig with a ~1.7 MiB full-screen PNG: losses of roughly one to two blocks recurred at every window size (2, 4 and 8), while ~1.2 MiB captures completed byte-exact. The loss is in the UART/ESP32 hop, so the master treats it as retryable and never publishes a partial image.
+- The master compares the declared dimensions with the PNG IHDR: an inconsistent response is rejected and no image is published.
+- The capture is best effort: a locked session, secure desktop, protected surface or disconnected RDP session may be reported as `screen_capture_failed` (retryable) with the real diagnostic. The agent encodes the PNG in memory and writes no screenshot file.
+- `screen_too_large` (not retryable) appears when the encoded PNG exceeds the 32 MiB ceiling. That ceiling is a memory guard for the agent and the master's receiver bound; it does not promise that an image below it crosses the link within the master's deadline.
+
+A receiver that abandons the stream stops acknowledging blocks, so the slave stops after its bounded ACK retries (`ack_timeout`, `1 + 3` resends of one second each). There is no second cancellation protocol.
 
 ## Priority
 

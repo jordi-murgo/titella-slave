@@ -6,11 +6,14 @@
 # downloads anything and never asks for elevation.
 #
 # It is written to be small: everything the slave needs is already available in
-# the payload the master sends over the CDC, so the typed text only has to
-# open the port, frame the blocks, verify the digest and start the agent.
+# the payload the master sends, so the typed part only has to open the selected
+# transport (CDC, clipboard or HID), frame the blocks, verify the digest and
+# start the agent.
 #
 # Placeholders: __LINK_ID__, __SESSION_ID__, __CDC_PORT__ (empty = resolve the
-# port from the PnP identity of the rig).
+# port from the PnP identity of the rig; 'CLIPBOARD' and 'HID:<serial>' are
+# internal sentinels of this field, never public port values) plus the trailing
+# transport-source constant, substituted only for the HID sentinel.
 $ErrorActionPreference = 'Stop'
 try { Set-PSReadLineOption -HistorySaveStyle SaveNothing } catch { }
 $script:L = '__LINK_ID__'
@@ -28,6 +31,21 @@ $script:Dh = ''         # declared sha256
 $script:Sq = 0          # next sequence
 $script:Pr = $null      # pending request
 $script:Po = $null      # pending op
+$script:PortName = $null  # transport the started agent will use
+$script:Cb = $false     # shared-clipboard transport ($script:Pin -eq 'CLIPBOARD')
+$script:Hs = $null      # HID byte stream ($script:Pin -eq 'HID:<serial>')
+$script:Hid = $false    # HID transport selected by the binding sentinel
+$script:Done = $false   # commit finished: HID returns instead of exiting
+$script:HidSrc = '__HID_TRANSPORT_SOURCE_B64__'  # legacy embedded transport unit
+# $script:CbRx / $script:CbTx / $script:M2S / $script:S2M stay untouched: a stub
+# that already opened the clipboard channel keeps its hooks and its packet
+# counters, so the loader continues the exchange instead of restarting it.
+$script:COut = New-Object 'System.Collections.Generic.List[string]'
+if ($null -eq $script:M2S) { $script:M2S = 0 }   # last M2S packet consumed
+if ($null -eq $script:S2M) { $script:S2M = 0 }   # last S2M packet sent
+$script:CBusy = $false  # true while one M2S packet's lines are handled
+$script:CAck = $false   # a consumed M2S packet still owes an acknowledgement
+$script:S2MPkt = ''    # last S2M packet text, re-asserted when lost
 
 function Fail([string]$Code, [string]$Message) {
   $e = New-Object System.Exception $Message
@@ -45,14 +63,54 @@ function Log([string]$Message) {
 }
 
 function Send($Frame) {
+  $line = ConvertTo-Json $Frame -Compress -Depth 8
+  if ($script:Cb) {
+    # One S2M packet carries every line produced while a master packet is
+    # being handled; standalone frames flush immediately.
+    [void]$script:COut.Add($line)
+    if (-not $script:CBusy) { Flush-Cb }
+    return
+  }
   if (-not $script:Tx) { return }
-  $b = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json $Frame -Compress -Depth 8) + "`n")
+  $b = [Text.Encoding]::UTF8.GetBytes($line + "`n")
   $script:Tx.Write($b, 0, $b.Length)
   $script:Tx.Flush()
 }
 
+function Read-Cb {
+  try {
+    if ($script:CbRx) { return (& $script:CbRx) }
+    return (Get-Clipboard -Raw)
+  } catch { return $null }
+}
+
+function Write-Cb([string]$Text) {
+  try {
+    if ($script:CbTx) { & $script:CbTx $Text } else { Set-Clipboard -Value $Text }
+    return $true
+  } catch { return $false }
+}
+
+function Flush-Cb {
+  $text = ''
+  if ($script:COut.Count -gt 0) {
+    $script:S2M = $script:S2M + 1
+    $text = 'TITELLA_S2M:' + $script:L + ':' + $script:S2M + ':' + $script:M2S + "`n" +
+      ($script:COut -join "`n") + "`n"
+  } elseif ($script:CAck -and $script:M2S -gt 0) {
+    # Pure acknowledgement: sequence 0 never needs an acknowledgement back.
+    $text = 'TITELLA_S2M:' + $script:L + ':0:' + $script:M2S + "`n"
+  } else { return }
+  if (Write-Cb $text) {
+    if ($script:COut.Count -gt 0) { $script:COut.Clear() }
+    # A data packet's header already carries the acknowledgement.
+    $script:CAck = $false
+    $script:S2MPkt = $text
+  }
+}
+
 function Error-Frame([string]$Code, [string]$Message) {
-  if ($script:Tx) {
+  if ($script:Tx -or $script:Cb) {
     $f = @{ v = 1; channel = 'bootstrap'; type = 'error'; link_id = $script:L }
     if ($null -ne $script:Pr) { $f['request_id'] = $script:Pr; $f['op'] = $script:Po } else { $f['session_id'] = $script:S }
     $f['body'] = @{ code = $Code; message = $Message; retryable = $false }
@@ -61,9 +119,36 @@ function Error-Frame([string]$Code, [string]$Message) {
   [Console]::Error.WriteLine('titella loader: ' + $Code + ': ' + $Message)
 }
 
-function Close-Cdc {
-  if ($script:Sp) { try { $script:Sp.Close() } catch { }; try { $script:Sp.Dispose() } catch { } }
-  $script:Sp = $null; $script:Rx = $null; $script:Tx = $null
+function Close-Transport {
+  # The HID stream goes first: it owns the device handle and the named mutex,
+  # so releasing it late leaves the next open in this console hid_busy. The
+  # serial port follows, and the fields are nulled so a repeated call is a
+  # no-op even when Rx and Tx alias the same object.
+  if ($script:Hs) { try { $script:Hs.Dispose() } catch { }; $script:Hs = $null }
+  if ($script:Sp) { try { $script:Sp.Close() } catch { }; try { $script:Sp.Dispose() } catch { }; $script:Sp = $null }
+  $script:Rx = $null; $script:Tx = $null
+}
+
+function Open-Hid([string]$Binding) {
+  # Precompiled transport wins: the container bootstrap compiles the
+  # HidByteStream unit from the staged file in stage-0, before this loader
+  # runs, so the identical type is never compiled twice in the same console
+  # and no transport source is registered as script text here.
+  if ('Titella.Slave.HidByteStream' -as [type]) {
+    # precompiled by the stage-0 container split
+  } elseif ($script:HidSrc) {
+    # Legacy embedded form: the unit arrives as raw UTF-8 in Base64. Default
+    # Add-Type references cover the unit (System and System.Core on the
+    # .NET Framework): an explicit list breaks the compile on hosts whose
+    # System.dll does not carry System.Threading.
+    Add-Type -TypeDefinition ([Text.Encoding]::UTF8.GetString(
+      [Convert]::FromBase64String($script:HidSrc))) -IgnoreWarnings
+  } else {
+    throw (Fail 'invalid_argument' 'the HID binding carries no transport source')
+  }
+  $script:Hs = [Titella.Slave.HidByteStream]::Open($Binding)
+  $script:Rx = $script:Hs
+  $script:Tx = $script:Hs
 }
 
 function Open-Cdc([string]$Name) {
@@ -71,7 +156,9 @@ function Open-Cdc([string]$Name) {
   foreach ($wait in 0, 500, 1000, 2000, 5000) {
     if ($wait) { Start-Sleep -Milliseconds $wait }
     try {
-      $s = New-Object System.IO.Ports.SerialPort $Name, 115200, 'None', 8, 'One'
+      # The master→ESP32 UART runs at 2,000,000 baud; the CDC link carries the
+      # loader at the same speed, so a 115200 default would garble every frame.
+      $s = New-Object System.IO.Ports.SerialPort $Name, 2000000, 'None', 8, 'One'
       $s.Handshake = 'None'
       # Arduino USB CDC reports itself connected only while both DTR and RTS
       # are asserted; the firmware disables 1200-baud reboot, so asserting both
@@ -96,9 +183,11 @@ function Open-Cdc([string]$Name) {
 }
 
 function Resolve-Port {
-  # An explicit override always wins. Without one only the port of this rig is
-  # accepted: the firmware enumerates with the Espressif vendor id and a
-  # TITELLA- serial, so an unrelated COM device is never opened or written to.
+  # An explicit override always wins. Without one only the CDC of this rig is
+  # accepted: the firmware enumerates with the project vendor/product pair
+  # (17EF:A38F), the device must be present, and exactly one candidate is
+  # usable. Zero or several candidates fail explicitly instead of opening an
+  # unrelated serial device or guessing.
   $list = @()
   if ($script:Pin) {
     if ($script:Pin -notmatch '^COM[1-9][0-9]*$') {
@@ -110,12 +199,11 @@ function Resolve-Port {
     throw (Fail 'cdc_not_found' 'this Windows does not expose the PnP device identity: pass slave_cdc_port explicitly')
   }
   $present = @([IO.Ports.SerialPort]::GetPortNames())
-  foreach ($d in @(Get-PnpDevice -Class Ports -ErrorAction SilentlyContinue)) {
+  foreach ($d in @(Get-PnpDevice -PresentOnly -Class Ports -ErrorAction SilentlyContinue)) {
     if (-not $d.InstanceId -or -not ($d.FriendlyName -match '\(COM([1-9][0-9]*)\)')) { continue }
     $com = 'COM' + $Matches[1]
     if ($present -notcontains $com) { continue }
-    if ($d.InstanceId -match 'VID_303A' -or $d.InstanceId -match 'TITELLA-' -or
-        [string]$d.FriendlyName -like 'Titella KVM*') {
+    if ($d.InstanceId -match 'VID_17EF&PID_A38F') {
       if ($list -notcontains $com) { $list += $com }
     }
   }
@@ -156,31 +244,141 @@ function Complete-Commit([int]$RequestId) {
   $script:Po = $null
 }
 
+# One bootstrap frame, shared by the serial byte loop and the clipboard packet
+# loop. The commit branch starts the agent and exits the loader.
+function Handle-Frame($f) {
+  if ($f.type -eq 'request') {
+    $rid = $f.request_id
+    if ($null -eq $rid) { return }
+    if ([string]$f.op -eq 'begin') {
+      $body = $f.body
+      if ($null -eq $body) { throw (Fail 'invalid_argument' 'begin without a body') }
+      $size = $body.size
+      $sha = [string]$body.sha256
+      if ($null -eq $size -or [long]$size -lt 0 -or $sha.Length -ne 64) {
+        throw (Fail 'invalid_argument' 'begin requires size and sha256')
+      }
+      if ($script:Wr) { try { $script:Wr.Dispose() } catch { }; $script:Wr = $null }
+      $script:Ds = [long]$size
+      $script:Dh = $sha
+      $script:Sq = 0
+      $script:Pr = $rid
+      $script:Po = 'begin'
+      $script:Wr = [IO.File]::Open($script:Pt, 'Create', 'Write', 'None')
+      Send @{
+        v = 1; channel = 'bootstrap'; type = 'response'; link_id = $script:L
+        request_id = $rid; op = 'begin'
+        body = @{ status = 'ready'; session_id = $script:S }
+      }
+      $script:Pr = $null
+      $script:Po = $null
+    } elseif ([string]$f.op -eq 'commit') {
+      Complete-Commit $rid
+      # The commit response must be on the clipboard before this loader exits.
+      if ($script:Cb) { Flush-Cb }
+      # The resolved transport name is kept in its own variable before the
+      # transport is closed. Its Write returns only after the peer acknowledged
+      # the response, so the stream can be disposed with nothing in flight.
+      $resolved = $script:PortName
+      Close-Transport
+      Log ('payload installed, starting the agent on ' + $resolved)
+      Start-Agent $resolved
+      if ($script:Hid) {
+        # HID keeps this console usable for another bootstrap.
+        $script:Done = $true
+      } else {
+        exit 0
+      }
+    }
+  } elseif ($f.type -eq 'data') {
+    if (-not $script:Wr -or [string]$f.session_id -ne $script:S) { return }
+    $seq = $f.seq
+    if (-not ($seq -is [int]) -and -not ($seq -is [long])) { return }
+    $seq = [int]$seq
+    if ($seq -lt 0 -or -not ($f.data_b64 -is [string])) { return }
+    $chunk = $null
+    try { $chunk = [Convert]::FromBase64String([string]$f.data_b64) }
+    catch { throw (Fail 'invalid_argument' 'data carries invalid base64') }
+    if ($chunk.Length -gt 512) { throw (Fail 'invalid_argument' 'a data chunk exceeds 512 bytes') }
+    if ($seq -eq $script:Sq) { $script:Wr.Write($chunk, 0, $chunk.Length); $script:Sq++ }
+    if ($seq -le $script:Sq) {
+      Send @{ v = 1; channel = 'bootstrap'; type = 'ack'; link_id = $script:L; session_id = $script:S; ack_seq = $seq }
+    }
+  }
+}
+
 function Start-Agent([string]$Name) {
   $fw = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319'
   if (-not (Test-Path -LiteralPath $fw)) { $fw = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319' }
   $sma = Join-Path $env:WINDIR 'Microsoft.NET\assembly\GAC_MSIL\System.Management.Automation'
   $sma = Get-ChildItem $sma -Recurse -Filter 'System.Management.Automation.dll' -ErrorAction SilentlyContinue |
     Select-Object -First 1 -ExpandProperty FullName
-  $refs = @('System.dll', 'System.Core.dll', 'System.Web.Extensions.dll') |
-    ForEach-Object { '"' + (Join-Path $fw $_) + '"' }
-  if ($sma) { $refs += '"' + $sma + '"' }
-  # One short command: compile the received source to a DLL on disk (so job
-  # children can LoadFrom it later) and run the agent. The child
-  # interpolates; every literal here is already quoted.
-  $dll = Join-Path $script:Rt 'agent.dll'
-  $cmd = 'try{$ErrorActionPreference="Stop";Add-Type -LiteralPath "' + $script:Cs +
-    '" -IgnoreWarnings -OutputAssembly "' + $dll + '" -ReferencedAssemblies ' + ($refs -join ',') +
-    '}catch{[IO.File]::WriteAllText("' + (Join-Path $script:Rt 'agent-compile.err.log') +
-    '",[string]$_,(New-Object Text.UTF8Encoding $false));exit 1}' +
-    ';exit [Reflection.Assembly]::LoadFrom("' + $dll + '").GetType("Titella.Slave.Agent").' +
-    'GetMethod("Run").Invoke($null,@("' + $script:Rt + '","' + $script:L + '","' + $Name + '",5000,30000))'
-  $psi = New-Object Diagnostics.ProcessStartInfo (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe')
-  $psi.Arguments = '-NoLogo -NoProfile -NonInteractive -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
+  # Compile the received source to agent.exe with the framework's own csc and
+  # start it directly: no powershell.exe child, no Add-Type, no script text in
+  # any classic PowerShell log channel. The compile is synchronous (seconds)
+  # stays inside the bootstrap hello wait; on failure the compile log is
+  # kept and the loader's error flow reports it instead of starting anything.
+  $exe = Join-Path $script:Rt 'agent.exe'
+  $errLog = Join-Path $script:Rt 'agent-compile.err.log'
+  $refs = @('System.dll', 'System.Core.dll', 'System.Web.Extensions.dll', 'System.Drawing.dll') |
+    ForEach-Object { '/r:' + (Join-Path $fw $_) }
+  if ($sma) { $refs += ('/r:' + $sma) }
+  $eap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    & (Join-Path $fw 'csc.exe') /nologo /target:exe /main:Titella.Slave.AgentHost "/out:$exe" $refs $script:Cs 2> $errLog
+  } catch {
+    $ErrorActionPreference = $eap
+    throw (Fail 'payload_compile_failed' ('csc could not run: ' + $_.Exception.Message))
+  }
+  $code = $LASTEXITCODE
+  $ErrorActionPreference = $eap
+  if ($code -ne 0) {
+    throw (Fail 'payload_compile_failed' ('csc exited with ' + $code + '; see agent-compile.err.log'))
+  }
+  [IO.File]::Delete($script:Cs)
+  if (Test-Path -LiteralPath $errLog) { if ((Get-Item -LiteralPath $errLog).Length -eq 0) { Remove-Item -LiteralPath $errLog -Force -ErrorAction SilentlyContinue } }
+  # The fixed agent.json next to the executable carries every argument the
+  # agent needs; the process itself starts with no command line at all.
+  $config = [ordered]@{
+    bootstrap_dir = $script:Rt
+    link_id       = $script:L
+    port          = $Name
+    heartbeat_ms  = 5000
+    grace_ms      = 30000
+  }
+  [IO.File]::WriteAllText((Join-Path $script:Rt 'agent.json'), (ConvertTo-Json $config -Compress),
+    (New-Object Text.UTF8Encoding $false))
+  $psi = New-Object Diagnostics.ProcessStartInfo $exe
   $psi.WorkingDirectory = $script:Rt
   $psi.UseShellExecute = $false
   $psi.CreateNoWindow = $true
   [Diagnostics.Process]::Start($psi) | Out-Null
+}
+
+# One bounded byte buffer shared by every transport loop: 4096-byte lines,
+# discarding up to the next LF on overflow. Handle-Frame may finish the
+# bootstrap (commit); Parse-Buffer honours that by returning immediately.
+function Parse-Buffer([byte[]]$read, [int]$count) {
+  $at = 0
+  while ($at -lt $count) {
+    $lf = [Array]::IndexOf($read, [byte]10, $at, $count - $at)
+    $end = if ($lf -lt 0) { $count } else { $lf }
+    $span = $end - $at
+    if ($script:Fl + $span -gt 4096) { $script:Fl = 4097 }
+    elseif ($span -gt 0) { [Array]::Copy($read, $at, $script:Fb, $script:Fl, $span); $script:Fl += $span }
+    if ($lf -lt 0) { break }
+    $text = ''
+    if ($script:Fl -le 4096) { $text = [Text.Encoding]::UTF8.GetString($script:Fb, 0, $script:Fl).TrimEnd([char]13) }
+    $script:Fl = 0
+    $at = $lf + 1
+    if (-not $text) { continue }
+    $f = $null
+    try { $f = $text | ConvertFrom-Json } catch { continue }
+    if ($null -eq $f -or $f.v -ne 1 -or $f.link_id -ne $script:L -or $f.channel -ne 'bootstrap') { continue }
+    Handle-Frame $f
+    if ($script:Done) { return }
+  }
 }
 
 try {
@@ -197,13 +395,57 @@ try {
     exit 1
   }
   $dotnet = [string]$ndp.Version
-
+  # Tombstone sweep: bootstrap directories of previous runs are deletable
+  # once their owner process is gone. Only bare 16-hex-digit names under
+  # TEMP carrying owner.json are considered; a directory without the marker
+  # is never touched, and one whose owner pid is still alive is left alone.
+  # The sweep is idempotent and external to this run's directory.
+  try {
+    foreach ($d in @(Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Directory -ErrorAction SilentlyContinue)) {
+      if ($d.Name -cnotmatch '^[0-9a-f]{16}$') { continue }
+      $marker = Join-Path $d.FullName 'owner.json'
+      if (-not (Test-Path -LiteralPath $marker)) { continue }
+      $alive = $false
+      try {
+        $owner = [IO.File]::ReadAllText($marker) | ConvertFrom-Json
+        if ($owner.pid -is [int] -and $owner.pid -gt 0) {
+          try { [void][Diagnostics.Process]::GetProcessById([int]$owner.pid); $alive = $true } catch { }
+        }
+      } catch { }
+      # A marker whose pid cannot be established as alive is a tombstone: it
+      # is deleted. A live pid means the directory still belongs to a running
+      # process and is never touched.
+      if ($alive) { continue }
+      try { [IO.Directory]::Delete($d.FullName, $true) } catch { }
+    }
+  } catch { }
   $script:Rt = Join-Path ([IO.Path]::GetTempPath()) ([Guid]::NewGuid().ToString('N').Substring(0, 16))
   New-Item -ItemType Directory -Path $script:Rt | Out-Null
   $script:Cs = Join-Path $script:Rt 'payload.cs'
   $script:Pt = Join-Path $script:Rt '.part'
+  # The ownership marker this run's directory carries until the next sweep:
+  # the loader names the console, the started agent takes the marker over.
+  [IO.File]::WriteAllText((Join-Path $script:Rt 'owner.json'),
+    ('{"session_id":"' + $script:S + '","pid":' + $PID + '}'),
+    (New-Object Text.UTF8Encoding $false))
 
-  if ($script:Sp -and $script:Sp.IsOpen) {
+  $script:Cb = ($script:Pin -eq 'CLIPBOARD')
+  if ($script:Pin -like 'HID:*') {
+    if ($script:Pin -cnotmatch '^HID:[0-9A-F]{12}$') {
+      throw (Fail 'invalid_argument' ('the HID binding must be HID:<12 uppercase hex characters>, got ' + $script:Pin))
+    }
+    $script:Hid = $true
+  }
+  if ($script:Cb) {
+    $script:PortName = 'CLIPBOARD'
+    Log 'clipboard transport selected'
+  } elseif ($script:Hid) {
+    # The binding names the vendor data collection; a serial port a previous
+    # stub left open is not part of this transport and is never reused.
+    Open-Hid $script:Pin
+    $script:PortName = $script:Pin
+    Log ('opened ' + $script:Pin)
+  } elseif ($script:Sp -and $script:Sp.IsOpen) {
     # Reuse the port opened by the stub so COMx is opened only once in
     # PowerShell and DTR/RTS stay asserted across Stage 1 and Stage 2.
     $name = $script:Sp.PortName
@@ -221,93 +463,90 @@ try {
       throw (Fail 'cdc_not_found' ('could not open ' + ($candidates -join ', ') + ': pass slave_cdc_port explicitly'))
     }
   }
-  Log ('opened ' + $name)
+  if (-not ($script:Cb -or $script:Hid)) {
+    $script:PortName = $name
+    Log ('opened ' + $name)
+  }
   Send @{
     v = 1; channel = 'bootstrap'; type = 'event'; link_id = $script:L
     session_id = $script:S; op = 'loader.ready'; body = @{ dotnet = $dotnet }
   }
 
-  # Bounded framing: 4096-byte lines, discarding up to the next LF on overflow.
-  $read = New-Object byte[] 4096
-  $line = New-Object byte[] 4097
-  $len = 0
-  $deadline = [DateTime]::UtcNow.AddSeconds(180)
-  while ([DateTime]::UtcNow -lt $deadline) {
-    $avail = 0
-    try { $avail = $script:Sp.BytesToRead } catch { throw (Fail 'cdc_disconnected' ('the CDC is gone: ' + $_.Exception.Message)) }
-    if ($avail -le 0) { Start-Sleep -Milliseconds 15; continue }
-    if ($avail -gt $read.Length) { $avail = $read.Length }
-    $count = $script:Rx.Read($read, 0, $avail)
-    if ($count -le 0) { continue }
-    $at = 0
-    while ($at -lt $count) {
-      $lf = [Array]::IndexOf($read, [byte]10, $at, $count - $at)
-      $end = if ($lf -lt 0) { $count } else { $lf }
-      $span = $end - $at
-      if ($len + $span -gt 4096) { $len = 4097 }
-      elseif ($span -gt 0) { [Array]::Copy($read, $at, $line, $len, $span); $len += $span }
-      if ($lf -lt 0) { break }
-      $text = ''
-      if ($len -le 4096) { $text = [Text.Encoding]::UTF8.GetString($line, 0, $len).TrimEnd([char]13) }
-      $len = 0
-      $at = $lf + 1
-      if (-not $text) { continue }
-      $f = $null
-      try { $f = $text | ConvertFrom-Json } catch { continue }
-      if ($null -eq $f -or $f.v -ne 1 -or $f.link_id -ne $script:L -or $f.channel -ne 'bootstrap') { continue }
-      if ($f.type -eq 'request') {
-        $rid = $f.request_id
-        if ($null -eq $rid) { continue }
-        if ([string]$f.op -eq 'begin') {
-          $body = $f.body
-          if ($null -eq $body) { throw (Fail 'invalid_argument' 'begin without a body') }
-          $size = $body.size
-          $sha = [string]$body.sha256
-          if ($null -eq $size -or [long]$size -lt 0 -or $sha.Length -ne 64) {
-            throw (Fail 'invalid_argument' 'begin requires size and sha256')
+  # Clipboard rigs carry the same frames inside TITELLA_M2S packets polled
+  # every 20 ms; one S2M packet answers each batch.
+  if ($script:Cb) {
+    $deadline = [DateTime]::UtcNow.AddSeconds(180)
+    $seen = $null
+    while ([DateTime]::UtcNow -lt $deadline) {
+      $text = Read-Cb
+      if ($null -ne $text -and $text -cne $seen) {
+        $seen = $text
+        if ($text -like 'TITELLA_M2S:*') {
+          $rows = $text -split "`n"
+          $head = ($rows[0].TrimEnd("`r")) -split ':'
+          if ($head.Count -ge 4 -and $head[1] -eq $script:L) {
+            $seq = -1L
+            if (-not [long]::TryParse($head[2], [ref]$seq)) { $seq = -1L }
+            if ($seq -gt $script:M2S) {
+              $script:M2S = $seq
+              $script:CAck = $true
+              $script:CBusy = $true
+              try {
+                for ($i = 1; $i -lt $rows.Count; $i++) {
+                  $line = $rows[$i].TrimEnd("`r")
+                  if (-not $line) { continue }
+                  $f = $null
+                  try { $f = $line | ConvertFrom-Json } catch { continue }
+                  if ($null -eq $f -or $f.v -ne 1 -or $f.link_id -ne $script:L -or $f.channel -ne 'bootstrap') { continue }
+                  Handle-Frame $f
+                }
+              } finally {
+                $script:CBusy = $false
+                Flush-Cb
+              }
+            } elseif ($seq -eq $script:M2S -and $seq -gt 0) {
+              # A re-asserted duplicate: the peer missed our answer, so put
+              # the last S2M packet back on the clipboard.
+              $script:CAck = $true
+              if ($script:S2MPkt) { [void](Write-Cb $script:S2MPkt) }
+            }
           }
-          if ($script:Wr) { try { $script:Wr.Dispose() } catch { }; $script:Wr = $null }
-          $script:Ds = [long]$size
-          $script:Dh = $sha
-          $script:Sq = 0
-          $script:Pr = $rid
-          $script:Po = 'begin'
-          $script:Wr = [IO.File]::Open($script:Pt, 'Create', 'Write', 'None')
-          Send @{
-            v = 1; channel = 'bootstrap'; type = 'response'; link_id = $script:L
-            request_id = $rid; op = 'begin'
-            body = @{ status = 'ready'; session_id = $script:S }
-          }
-          $script:Pr = $null
-          $script:Po = $null
-        } elseif ([string]$f.op -eq 'commit') {
-          Complete-Commit $rid
-          # $port would alias $script:Sp's neighbour name space; keep the
-          # resolved name in its own variable before the port is closed.
-          $resolved = $name
-          Close-Cdc
-          Log ('payload installed, starting the agent on ' + $resolved)
-          Start-Agent $resolved
-          exit 0
-        }
-      } elseif ($f.type -eq 'data') {
-        if (-not $script:Wr -or [string]$f.session_id -ne $script:S) { continue }
-        $seq = $f.seq
-        if (-not ($seq -is [int]) -and -not ($seq -is [long])) { continue }
-        $seq = [int]$seq
-        if ($seq -lt 0 -or -not ($f.data_b64 -is [string])) { continue }
-        $chunk = $null
-        try { $chunk = [Convert]::FromBase64String([string]$f.data_b64) }
-        catch { throw (Fail 'invalid_argument' 'data carries invalid base64') }
-        if ($chunk.Length -gt 512) { throw (Fail 'invalid_argument' 'a data chunk exceeds 512 bytes') }
-        if ($seq -eq $script:Sq) { $script:Wr.Write($chunk, 0, $chunk.Length); $script:Sq++ }
-        if ($seq -le $script:Sq) {
-          Send @{ v = 1; channel = 'bootstrap'; type = 'ack'; link_id = $script:L; session_id = $script:S; ack_seq = $seq }
         }
       }
+      # Retry an answer whose write lost the clipboard to another process.
+      if ($script:COut.Count -gt 0 -or $script:CAck) { Flush-Cb }
+      Start-Sleep -Milliseconds 20
     }
+    throw (Fail 'bootstrap_timeout' 'the bootstrap did not complete within its deadline')
   }
-  throw (Fail 'bootstrap_timeout' 'the bootstrap did not complete within its deadline')
+
+  # Bounded framing is shared by both byte transports: the parser keeps state
+  # in $script:Fb/$script:Fl across reads.
+  $script:Fb = New-Object byte[] 4097
+  $script:Fl = 0
+  $read = New-Object byte[] 4096
+  $deadline = [DateTime]::UtcNow.AddSeconds(180)
+  while ((-not $script:Done) -and [DateTime]::UtcNow -lt $deadline) {
+    $count = 0
+    if ($script:Hid) {
+      # HidByteStream.Read answers after at most 100 idle milliseconds, so the
+      # loop needs no availability probe.
+      $count = $script:Rx.Read($read, 0, $read.Length)
+    } else {
+      $avail = 0
+      try { $avail = $script:Sp.BytesToRead } catch { throw (Fail 'cdc_disconnected' ('the CDC is gone: ' + $_.Exception.Message)) }
+      if ($avail -le 0) { Start-Sleep -Milliseconds 15; continue }
+      if ($avail -gt $read.Length) { $avail = $read.Length }
+      $count = $script:Rx.Read($read, 0, $avail)
+    }
+    if ($count -le 0) { continue }
+    Parse-Buffer $read $count
+  }
+  if (-not $script:Done) {
+    throw (Fail 'bootstrap_timeout' 'the bootstrap did not complete within its deadline')
+  }
+  # HID finishes here: the agent runs detached and this console can receive
+  # another bootstrap. The CDC and clipboard paths exited inside the commit.
 } catch {
   $code = 'bootstrap_failed'
   $message = $_.Exception.Message
@@ -324,9 +563,11 @@ try {
   if ($script:Wr) { try { $script:Wr.Dispose() } catch { }; $script:Wr = $null }
   if ($script:Pt -and (Test-Path -LiteralPath $script:Pt)) { try { [IO.File]::Delete($script:Pt) } catch { } }
   Error-Frame $code $message
-  Close-Cdc
+  Close-Transport
   if ($script:Rt -and (Test-Path -LiteralPath $script:Rt) -and ((Split-Path -Leaf $script:Rt) -match '^[0-9a-f]{16}$')) {
     try { [IO.Directory]::Delete($script:Rt, $true) } catch { }
   }
-  exit 1
+  # HID keeps the console alive: the failure is already reported to the master
+  # and printed here, and the next bootstrap can be typed in this window.
+  if (-not $script:Hid) { exit 1 }
 }

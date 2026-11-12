@@ -197,7 +197,13 @@ class SlaveAgent(object):
             result["stream_id"] = stream_id
             result["payload_kind"] = "bytes"
             self.link.response(frame, result)
-            self._start_stream("fs", stream_id, payload, "fs.stream.finished")
+            if frame["op"] == "screen":
+                # A screenshot is hundreds of KiB or more: the windowed sender
+                # is the one the transfer channel proved on this link, while
+                # stop-and-wait moves about 3.5 KiB/s.
+                self._start_windowed_stream("fs", stream_id, payload, "fs.stream.finished")
+            else:
+                self._start_stream("fs", stream_id, payload, "fs.stream.finished")
             return
         encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if len(encoded) > 2048:
@@ -220,6 +226,29 @@ class SlaveAgent(object):
                     "status": "error", "code": "stream_failed", "message": str(exc), "retryable": True,
                 })
         threading.Thread(target=send, name="fs-stream-%s" % stream_id[:8], daemon=True).start()
+
+    def _start_windowed_stream(self, channel, stream_id, payload, final_op):
+        """Sends with the sliding window the transfer channel already uses."""
+        def send():
+            position = [0]
+
+            def read_chunk():
+                start = position[0]
+                if start >= len(payload):
+                    return b""
+                position[0] = start + 512
+                return payload[start:start + 512]
+
+            try:
+                sent = self.link.stream_data(channel, stream_id, read_chunk)
+                self.link.event(channel, final_op, stream_id,
+                                {"status": "finished", "bytes": sent})
+            except BaseException as exc:
+                self.link.event(channel, final_op, stream_id, {
+                    "status": "error", "code": "stream_failed",
+                    "message": str(exc), "retryable": True,
+                })
+        threading.Thread(target=send, name="fs-window-%s" % stream_id[:8], daemon=True).start()
 
     def _transfer(self, frame):
         body = frame.get("body") or {}

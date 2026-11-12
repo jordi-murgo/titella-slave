@@ -1,4 +1,8 @@
-"""Stdlib-only CDC link of the ephemeral agent."""
+"""Stdlib-only CDC link of the ephemeral agent.
+
+The native CDC port is the default transport; port "CLIPBOARD" selects the
+shared-desktop-clipboard transport used by agent_protocol = "clipboard".
+"""
 from __future__ import print_function
 
 import errno
@@ -9,6 +13,7 @@ import os
 import queue
 import re
 import select
+import shutil
 import subprocess
 import termios
 import threading
@@ -32,6 +37,237 @@ _ACK_RETRIES = 3
 _SERIAL_RE = re.compile(r"/dev/cu\.usbmodem[^\s\"']+")
 _BACKOFF = (0.5, 1.0, 2.0, 5.0)
 
+_CLIPBOARD_PORT = "CLIPBOARD"
+
+
+def _is_clipboard_port(port):
+    return isinstance(port, str) and port.strip().upper() == _CLIPBOARD_PORT
+
+
+class _ClipboardTransport(object):
+    """Shared-clipboard CDC for agent_protocol = "clipboard".
+
+    The master writes ``TITELLA_M2S:<link_id>:<seq>:<ack>`` packets to the
+    desktop clipboard and the slave answers with ``TITELLA_S2M`` packets that
+    carry newline-delimited JSON v1 frames. Exactly one outbound packet is
+    unacknowledged at a time; a pure acknowledgement reuses packet sequence 0
+    so it never needs an acknowledgement of its own.
+
+    The master sends no idle heartbeats over the clipboard, so :meth:`pump`
+    feeds the link a synthetic local heartbeat while it is quiet and drops the
+    link's own idle heartbeats before they can touch the user clipboard.
+    """
+
+    _ACK_DELAY_S = 0.010
+    _REASSERT_S = 0.150
+    _HEARTBEAT_S = 2.0
+    _MAX_LINES = 16
+    _MAX_REASSERTS = 40
+    _MAX_LINE_BYTES = 4096
+    _MAX_PARTIAL_BYTES = 65536
+    _TOOL_TIMEOUT_S = 5.0
+
+    def __init__(self, link_id):
+        self._link_id = link_id
+        self._lock = threading.Lock()
+        self._rx = []
+        self._tx_lines = []
+        self._partial = b""
+        self._last_m2s = 0
+        self._next_s2m = 1
+        self._inflight = 0
+        self._inflight_text = None
+        self._inflight_at = 0.0
+        self._inflight_attempts = 0
+        self._ack_pending = False
+        self._ack_pending_at = 0.0
+        self._last_text = None
+        self._last_heartbeat = time.monotonic()
+        self._paste = None
+        self._copy = None
+        self._closed = False
+
+    def open(self):
+        """Resolves the platform clipboard tool; raises when none exists."""
+        pairs = []
+        paste = shutil.which("pbpaste")
+        copy = shutil.which("pbcopy")
+        if paste and copy:
+            pairs.append(([paste], [copy]))
+        paste = shutil.which("wl-paste")
+        copy = shutil.which("wl-copy")
+        if paste and copy:
+            pairs.append(([paste], [copy]))
+        xclip = shutil.which("xclip")
+        if xclip:
+            pairs.append(([xclip, "-selection", "clipboard", "-o"],
+                          [xclip, "-selection", "clipboard"]))
+        if not pairs:
+            raise FileNotFoundError(
+                "clipboard_unavailable: pbcopy, wl-copy or xclip is required")
+        self._paste, self._copy = pairs[0]
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            self._tx_lines = []
+            self._rx = []
+
+    def write(self, data):
+        """Buffers one encoded frame; the reader thread flushes packets."""
+        with self._lock:
+            if self._closed:
+                raise OSError(errno.EIO, "clipboard transport closed")
+            if self._partial:
+                self._partial += bytes(data)
+            else:
+                self._partial = bytes(data)
+            while True:
+                newline = self._partial.find(b"\n")
+                if newline < 0:
+                    if len(self._partial) > self._MAX_PARTIAL_BYTES:
+                        # The wire never splits a line past the frame bound.
+                        self._partial = b""
+                    return
+                line = self._partial[:newline]
+                self._partial = self._partial[newline + 1:]
+                text = line.decode("utf-8", "replace").rstrip("\r")
+                if not text:
+                    continue
+                # A quiet link must never touch the shared clipboard.
+                if '"channel":"control"' in text and '"type":"heartbeat"' in text:
+                    continue
+                self._tx_lines.append(text)
+
+    def pump(self):
+        """One poll cycle: read, acknowledge, flush; returns frame bytes."""
+        text = self._read_clipboard()
+        now = time.monotonic()
+        with self._lock:
+            if self._closed:
+                return b""
+            self._consume(text, now)
+            self._reassert(now)
+            self._flush(now)
+            if self._rx:
+                chunk = b"".join(self._rx)
+                self._rx = []
+                self._last_heartbeat = now
+                return chunk
+            if now - self._last_heartbeat >= self._HEARTBEAT_S:
+                self._last_heartbeat = now
+                return ('{"v":1,"channel":"control","type":"heartbeat",'
+                        '"link_id":"%s"}\n' % self._link_id).encode("utf-8")
+            return b""
+
+    def _consume(self, text, now):
+        if text is None or text == self._last_text:
+            return
+        self._last_text = text
+        prefix = "TITELLA_M2S:" + self._link_id + ":"
+        if not text.startswith(prefix):
+            return
+        head, _, body = text.partition("\n")
+        parts = head.strip().split(":")
+        if len(parts) != 4:
+            return
+        try:
+            m2s = int(parts[2])
+            ack = int(parts[3])
+        except ValueError:
+            return
+        if self._inflight and ack >= self._inflight:
+            self._inflight = 0
+            self._inflight_text = None
+            self._inflight_attempts = 0
+        if m2s > self._last_m2s:
+            self._last_m2s = m2s
+            for raw in body.split("\n"):
+                line = raw.rstrip("\r")
+                if not line:
+                    continue
+                payload = line.encode("utf-8") + b"\n"
+                if len(payload) > self._MAX_LINE_BYTES + 1:
+                    continue
+                self._rx.append(payload)
+            self._ack_pending = True
+            self._ack_pending_at = now
+        elif m2s == self._last_m2s and m2s > 0:
+            # A re-asserted duplicate: the payload is already buffered, but
+            # the peer still needs the acknowledgement it missed.
+            self._ack_pending = True
+            self._ack_pending_at = now
+
+    def _reassert(self, now):
+        if not self._inflight or now - self._inflight_at < self._REASSERT_S:
+            return
+        if self._last_text == self._inflight_text:
+            return
+        if self._inflight_attempts >= self._MAX_REASSERTS:
+            # The peer stopped consuming packets: hand the block back to the
+            # link (its own ACK timeout retries) instead of overwriting the
+            # user clipboard forever.
+            self._inflight = 0
+            self._inflight_text = None
+            self._inflight_attempts = 0
+            return
+        if self._write_clipboard(self._inflight_text):
+            self._inflight_attempts += 1
+            self._inflight_at = now
+            self._last_text = self._inflight_text
+
+    def _flush(self, now):
+        if not self._inflight and self._tx_lines:
+            take = self._tx_lines[:self._MAX_LINES]
+            sequence = self._next_s2m
+            packet = ("TITELLA_S2M:%s:%d:%d\n"
+                      % (self._link_id, sequence, self._last_m2s)
+                      + "\n".join(take) + "\n")
+            if self._write_clipboard(packet):
+                del self._tx_lines[:self._MAX_LINES]
+                self._next_s2m = sequence + 1
+                self._inflight = sequence
+                self._inflight_text = packet
+                self._inflight_at = now
+                self._inflight_attempts = 0
+                # The packet header already carries the acknowledgement.
+                self._ack_pending = False
+                self._last_text = packet
+        elif self._ack_pending and now - self._ack_pending_at >= self._ACK_DELAY_S:
+            # Delay the pure acknowledgement briefly so responses produced by
+            # the dispatch thread ride the same packet.
+            packet = "TITELLA_S2M:%s:0:%d\n" % (self._link_id, self._last_m2s)
+            if self._write_clipboard(packet):
+                self._ack_pending = False
+                self._last_text = packet
+
+    def _read_clipboard(self):
+        try:
+            completed = subprocess.run(
+                self._paste,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=self._TOOL_TIMEOUT_S,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return completed.stdout.decode("utf-8", "replace")
+
+    def _write_clipboard(self, text):
+        try:
+            completed = subprocess.run(
+                self._copy,
+                input=text.encode("utf-8"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=self._TOOL_TIMEOUT_S,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return completed.returncode == 0
+
 
 class AgentLinkError(RuntimeError):
     pass
@@ -42,6 +278,8 @@ class AgentLink(object):
                  on_connect=None, on_expired=None):
         self.link_id = link_id
         self.port_arg = port
+        self.clipboard = _is_clipboard_port(port)
+        self._cb = _ClipboardTransport(link_id) if self.clipboard else None
         self.heartbeat_s = heartbeat_s
         self.grace_s = grace_s
         self.on_connect = on_connect
@@ -65,13 +303,16 @@ class AgentLink(object):
 
     @property
     def connected(self):
-        return self._connected.is_set() and self._fd is not None
+        if self._connected.is_set() and (self._fd is not None or self._cb is not None):
+            return True
+        return False
 
     def start(self):
         if self._threads:
             return
+        reader = self._clipboard_reader_loop if self.clipboard else self._reader_loop
         self._threads = [
-            threading.Thread(target=self._reader_loop, name="agent-cdc-reader", daemon=True),
+            threading.Thread(target=reader, name="agent-cdc-reader", daemon=True),
             threading.Thread(target=self._writer_loop, name="agent-cdc-writer", daemon=True),
             threading.Thread(target=self._heartbeat_loop, name="agent-heartbeat", daemon=True),
         ]
@@ -149,17 +390,40 @@ class AgentLink(object):
     def _close_fd(self):
         with self._fd_lock:
             fd, self._fd = self._fd, None
+            clipboard, self._cb = self._cb, None
             self._connected.clear()
         if fd is not None:
             try:
                 os.close(fd)
             except OSError:
                 pass
+        if clipboard is not None:
+            clipboard.close()
 
     def _lost(self):
         if self.disconnected_since is None:
             self.disconnected_since = time.monotonic()
         self._close_fd()
+
+    def _ingest(self, chunk):
+        """Feeds decoded bytes to the parser and routes every matching frame."""
+        for frame in self._parser.feed(chunk):
+            if frame.get("link_id") != self.link_id:
+                continue
+            self.last_seen = time.monotonic()
+            self.disconnected_since = None
+            if frame["type"] == "ack":
+                key = (frame["session_id"], frame["ack_seq"])
+                with self._acks_lock:
+                    event = self._acks.get(key)
+                    if event:
+                        event.set()
+                    self._ack_cond.notify_all()
+            else:
+                try:
+                    self.inbound.put(frame, timeout=1)
+                except queue.Full:
+                    self.send_error(frame, "queue_full", "inbound queue full", True)
 
     def _reader_loop(self):
         attempt = 0
@@ -184,25 +448,42 @@ class AgentLink(object):
                 chunk = os.read(fd, 4096)
                 if not chunk:
                     raise OSError(errno.EIO, "CDC EOF")
-                for frame in self._parser.feed(chunk):
-                    if frame.get("link_id") != self.link_id:
-                        continue
-                    self.last_seen = time.monotonic()
-                    self.disconnected_since = None
-                    if frame["type"] == "ack":
-                        key = (frame["session_id"], frame["ack_seq"])
-                        with self._acks_lock:
-                            event = self._acks.get(key)
-                            if event:
-                                event.set()
-                            self._ack_cond.notify_all()
-                    else:
-                        try:
-                            self.inbound.put(frame, timeout=1)
-                        except queue.Full:
-                            self.send_error(frame, "queue_full", "inbound queue full", True)
+                self._ingest(chunk)
             except (OSError, ValueError):
                 self._lost()
+
+    def _clipboard_reader_loop(self):
+        """Clipboard counterpart of the CDC reader: poll, ingest, repeat."""
+        transport = self._cb
+        if transport is None:
+            return
+        attempt = 0
+        while not self._stop.is_set():
+            try:
+                transport.open()
+                break
+            except (OSError, ValueError):
+                delay = _BACKOFF[min(attempt, len(_BACKOFF) - 1)]
+                attempt += 1
+                self._stop.wait(delay)
+        if self._stop.is_set():
+            return
+        with self._fd_lock:
+            self.port = self.port_arg
+            self._parser = FrameParser(FIRMWARE_TO_SLAVE, ignore_invalid=True)
+            self._connected.set()
+        if self.on_connect:
+            self.on_connect()
+        while not self._stop.is_set():
+            try:
+                chunk = transport.pump()
+            except (OSError, ValueError):
+                self._stop.wait(_BACKOFF[0])
+                continue
+            if not chunk:
+                self._stop.wait(0.02)
+                continue
+            self._ingest(chunk)
 
     def _priority(self, frame):
         if frame["type"] in ("ack", "heartbeat"):
@@ -230,6 +511,13 @@ class AgentLink(object):
                 continue
             try:
                 payload = encode_frame(frame, SLAVE_TO_FIRMWARE)
+                if self._cb is not None:
+                    try:
+                        self._cb.write(payload)
+                    except OSError:
+                        # A closed channel is the teardown path, not a loss.
+                        pass
+                    continue
                 while not self._stop.is_set():
                     if not self._connected.wait(0.25):
                         continue

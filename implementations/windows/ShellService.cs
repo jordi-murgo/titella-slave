@@ -3,7 +3,9 @@
 // model: every child is created suspended, assigned to a job object with
 // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, and only then resumed. Cancellation
 // and timeouts use TerminateJobObject; POSIX signals are neither available
-// nor simulated.
+// nor simulated. A job child is the agent executable itself (--job): no
+// powershell.exe process is spawned for jobs, so no classic PowerShell log
+// channel records a job start.
 
 namespace Titella.Slave
 {
@@ -78,10 +80,9 @@ namespace Titella.Slave
     }
 
     /// <summary>
-    /// Paths and command lines of the system Windows PowerShell. The job
-    /// command line never carries the user script: it only boots the
-    /// in-process Runspace runner, and the script itself travels over
-    /// stdin so no classic PowerShell log channel records its text.
+    /// Path of the system Windows PowerShell. It is only the default shell
+    /// of ConPTY terminals (operator interaction); jobs never run it, and the
+    /// job child is the agent executable itself with --job.
     /// </summary>
     internal static class PowerShell
     {
@@ -94,33 +95,6 @@ namespace Titella.Slave
             }
             return System.IO.Path.Combine(
                 root, @"System32\WindowsPowerShell\v1.0\powershell.exe");
-        }
-
-        public static string EncodeScript(string script)
-        {
-            return Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
-        }
-
-        /// <summary>
-        /// The short child command that runs one job: it loads this
-        /// assembly (already compiled by the bootstrap) and executes the
-        /// script piped over stdin inside a custom-host Runspace. The
-        /// runner is infrastructure; the user script never appears in any
-        /// process command line or PowerShell log.
-        /// </summary>
-        public static string JobRunnerCommand(string agentAssembly)
-        {
-            // Assembly.LoadFrom keeps the namespace resolution working for
-            // the Titella.Slave types; Add-Type -LiteralPath loads the
-            // bytes but does not register the assembly for type lookup.
-            StringBuilder commandLine = new StringBuilder();
-            commandLine.Append('"').Append(PowerShell.ExecutablePath()).Append('"');
-            commandLine.Append(" -NoLogo -NoProfile -NonInteractive -Command ");
-            commandLine.Append("$a=[Reflection.Assembly]::LoadFrom('");
-            commandLine.Append(agentAssembly.Replace("'", "''"));
-            commandLine.Append("');exit $a.GetType('Titella.Slave.JobEntry')." +
-                               "GetMethod('Run').Invoke($null,@())");
-            return commandLine.ToString();
         }
     }
 
@@ -244,8 +218,12 @@ namespace Titella.Slave
             string script =
                 "[Console]::InputEncoding=[System.Text.Encoding]::UTF8;" +
                 "$OutputEncoding=[System.Text.Encoding]::UTF8;" + command;
-            StringBuilder commandLine = new StringBuilder(
-                PowerShell.JobRunnerCommand(Agent.ExecutableAssembly()));
+            // The child is the agent executable itself: "<agent.exe>" --job
+            // boots JobEntry, which reads the script from stdin. No
+            // powershell.exe child and no assembly-loading command line.
+            string image = Agent.ExecutableAssembly();
+            StringBuilder commandLine = new StringBuilder();
+            commandLine.Append('"').Append(image).Append("\" --job");
 
             Win32Structs.SECURITY_ATTRIBUTES inheritable =
                 new Win32Structs.SECURITY_ATTRIBUTES();
@@ -304,7 +282,7 @@ namespace Titella.Slave
                 startup.lpAttributeList = IntPtr.Zero;
 
                 if (!NativeMethods.CreateProcessW(
-                        PowerShell.ExecutablePath(),
+                        image,
                         commandLine,
                         IntPtr.Zero,
                         IntPtr.Zero,

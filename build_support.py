@@ -26,16 +26,23 @@ except ImportError:  # pragma: no cover - only hit without setuptools installed
 _FIXED_TIME = (2020, 1, 1, 0, 0, 0)
 _SHEBANG = b"#!/usr/bin/env python3\n"
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 # Must match [project].version in pyproject.toml and
 # titella_slave_assets.__version__; the loader rejects any other value.
-ASSETS_VERSION = "1.0.0"
+ASSETS_VERSION = "1.1.0"
 
 PYTHON_PAYLOAD_NAME = "titella-slave.pyz"
 WINDOWS_PAYLOAD_NAME = "titella-slave.cs"
 PYTHON_LOADER_NAME = "python.py.tmpl"
 WINDOWS_LOADER_NAME = "windows.ps1.tmpl"
+WINDOWS_HID_STAGE0_NAME = "windows-hid-stage0.ps1.tmpl"
+WINDOWS_HID_TRANSPORT_NAME = "windows-hid-transport.cs"
+WINDOWS_HID_TRANSPORT_SOURCE = "HidByteStream.cs"
 MANIFEST_NAME = "manifest.json"
+
+# Upper bound shared with the master's bundle reader: the HID bootstrap
+# artifacts are refused above this size instead of being truncated.
+MAX_HID_ARTIFACT_BYTES = 64 * 1024
 
 # Canonical slave documents, packaged inside the wheel under ``_data/docs/``
 # so the master's documentation tools can serve them without a checkout.
@@ -180,6 +187,58 @@ def loader_bytes(root: Path, filename: str) -> bytes:
     return path.read_bytes()
 
 
+def hid_transport_source(root: Path) -> bytes:
+    """The sole .NET HID transport unit, packaged verbatim.
+
+    There is exactly one implementation of the 0x10 report protocol,
+    ``implementations/windows/HidByteStream.cs``. The packaged
+    ``windows-hid-transport.cs`` is a byte copy of it, so the master never
+    receives a second copy that can drift from the compiled agent.
+    """
+    path = Path(root) / "implementations" / "windows" / WINDOWS_HID_TRANSPORT_SOURCE
+    if not path.is_file():
+        raise TitellaBuildError(
+            "hid_transport_missing",
+            f"implementations/windows/{WINDOWS_HID_TRANSPORT_SOURCE} is missing",
+        )
+    data = path.read_bytes()
+    if data.startswith(b"\xef\xbb\xbf"):
+        raise TitellaBuildError(
+            "hid_transport_invalid",
+            f"{WINDOWS_HID_TRANSPORT_SOURCE} must be UTF-8 without BOM",
+        )
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise TitellaBuildError(
+            "hid_transport_invalid",
+            f"{WINDOWS_HID_TRANSPORT_SOURCE} is not valid UTF-8: {exc}",
+        ) from exc
+    return data
+
+
+def hid_bootstrap_entry(stage0: bytes, transport: bytes) -> dict[str, object]:
+    """The Windows ``hid_bootstrap`` block: exact keys, hashes from the bytes."""
+    return {
+        "stage0": WINDOWS_HID_STAGE0_NAME,
+        "stage0_sha256": hashlib.sha256(stage0).hexdigest(),
+        "transport": WINDOWS_HID_TRANSPORT_NAME,
+        "transport_sha256": hashlib.sha256(transport).hexdigest(),
+    }
+
+
+def _require_hid_artifact(name: str, data: bytes) -> None:
+    """Both HID artifacts are bounded before they ever reach the manifest."""
+    if not data:
+        raise TitellaBuildError("hid_artifact_invalid", f"{name} is empty")
+    if len(data) > MAX_HID_ARTIFACT_BYTES:
+        raise TitellaBuildError(
+            "hid_artifact_too_large",
+            f"{name} is {len(data)} bytes; the HID artifact bound is "
+            f"{MAX_HID_ARTIFACT_BYTES}",
+        )
+
+
 def manifest_entry(payload_name: str, loader_name: str, payload: bytes,
                    loader: bytes) -> dict[str, object]:
     """Manifest entry with size and hashes computed from the built bytes."""
@@ -218,6 +277,14 @@ def bundle_artifacts(root: Path) -> tuple[dict[str, object], list[tuple[str, byt
     python_loader = loader_bytes(root, PYTHON_LOADER_NAME)
     windows_payload = build_windows_source(root)
     windows_loader = loader_bytes(root, WINDOWS_LOADER_NAME)
+    hid_stage0 = loader_bytes(root, WINDOWS_HID_STAGE0_NAME)
+    _require_hid_artifact(WINDOWS_HID_STAGE0_NAME, hid_stage0)
+    hid_transport = hid_transport_source(root)
+    _require_hid_artifact(WINDOWS_HID_TRANSPORT_NAME, hid_transport)
+    windows_entry = manifest_entry(
+        WINDOWS_PAYLOAD_NAME, WINDOWS_LOADER_NAME, windows_payload, windows_loader
+    )
+    windows_entry["hid_bootstrap"] = hid_bootstrap_entry(hid_stage0, hid_transport)
     manifest: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "protocol": _protocol_version(root),
@@ -226,10 +293,7 @@ def bundle_artifacts(root: Path) -> tuple[dict[str, object], list[tuple[str, byt
             "python": manifest_entry(
                 PYTHON_PAYLOAD_NAME, PYTHON_LOADER_NAME, python_payload, python_loader
             ),
-            "windows-dotnet": manifest_entry(
-                WINDOWS_PAYLOAD_NAME, WINDOWS_LOADER_NAME,
-                windows_payload, windows_loader,
-            ),
+            "windows-dotnet": windows_entry,
         },
     }
     artifacts: list[tuple[str, bytes]] = [
@@ -237,6 +301,8 @@ def bundle_artifacts(root: Path) -> tuple[dict[str, object], list[tuple[str, byt
         (PYTHON_LOADER_NAME, python_loader),
         (WINDOWS_PAYLOAD_NAME, windows_payload),
         (WINDOWS_LOADER_NAME, windows_loader),
+        (WINDOWS_HID_STAGE0_NAME, hid_stage0),
+        (WINDOWS_HID_TRANSPORT_NAME, hid_transport),
     ]
     return manifest, artifacts
 

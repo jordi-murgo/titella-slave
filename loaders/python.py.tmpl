@@ -1,48 +1,110 @@
 import base64,fcntl,glob,hashlib,json,os,select,shutil,subprocess,sys,tempfile,termios,time
-L=globals().get("L","__LINK_ID__"); S="__SESSION_ID__"; P=__CDC_PORT__; partial=None; root=None; out=None; rid=None; rop=None
+L=globals().get("L","__LINK_ID__");S="__SESSION_ID__";P=__CDC_PORT__;partial=root=out=rid=rop=CBP=CBC=None;CBSEQ=CBLAST=0;CBOUT=[];CBBUSY=CB=CBACK=False;CBLASTPKT=""
 def send(ch,typ,**kw):
+ d={"v":1,"channel":ch,"type":typ,"link_id":L};d.update(kw);s=json.dumps(d,separators=(",",":"))
+ if CB:
+  CBOUT.append(s)
+  if not CBBUSY: cbflush()
+  return
  if fd is None: raise RuntimeError("cdc_closed")
- d={"v":1,"channel":ch,"type":typ,"link_id":L};d.update(kw);os.write(fd,(json.dumps(d,separators=(",",":"))+"\n").encode())
+ os.write(fd,(s+"\n").encode())
 def rawopen(p):
- f=os.open(p,os.O_RDWR|os.O_NOCTTY|os.O_NONBLOCK);hasattr(termios,"TIOCEXCL") and fcntl.ioctl(f,termios.TIOCEXCL);a=termios.tcgetattr(f);a[0]=a[1]=a[3]=0;a[2]=termios.CS8|termios.CREAD|termios.CLOCAL;a[4]=a[5]=termios.B115200;a[6][termios.VMIN]=0;a[6][termios.VTIME]=0;termios.tcsetattr(f,termios.TCSANOW,a);return f
+ f=os.open(p,os.O_RDWR|os.O_NOCTTY|os.O_NONBLOCK);hasattr(termios,"TIOCEXCL") and fcntl.ioctl(f,termios.TIOCEXCL);a=termios.tcgetattr(f);a[0]=a[1]=a[3]=0;a[2]=termios.CS8|termios.CREAD|termios.CLOCAL;a[4]=a[5]=termios.B115200;a[6][termios.VMIN]=a[6][termios.VTIME]=0;termios.tcsetattr(f,termios.TCSANOW,a);return f
 def candidates():
- # The only override is the one the master renders into this loader; a path
- # inherited from the environment is not a second, undocumented channel.
  if P: return [P]
- preferred=[]
+ pref=[]
  try:
-  text=subprocess.run(["/usr/sbin/ioreg","-r","-c","IOSerialBSDClient","-l"],capture_output=True,text=True,timeout=3).stdout
+  t=subprocess.run(["/usr/sbin/ioreg","-r","-c","IOSerialBSDClient","-l"],capture_output=True,text=True,timeout=3).stdout
   for p in glob.glob("/dev/cu.usbmodem*"):
-   if p in text and "Titella KVM" in text: preferred.append(p)
+   if p in t and "Titella KVM" in t: pref.append(p)
  except Exception: pass
- mac=sorted(glob.glob("/dev/cu.usbmodem*"))
- # On Linux the native CDC shows up as ttyACM*; without this the loader would
- # only work on macOS.
- linux=sorted(glob.glob("/dev/ttyACM*"))
- return preferred+[p for p in mac+linux if p not in preferred]
+ m=sorted(glob.glob("/dev/cu.usbmodem*"))+sorted(glob.glob("/dev/ttyACM*"))
+ return pref+[p for p in m if p not in pref]
 def cleanup_old():
  now=time.time()
- for pat in ("titella-bootstrap-*",):
-  for p in glob.glob(os.path.join(tempfile.gettempdir(),pat)):
-   try:
-    if now-os.stat(p).st_mtime>86400 and os.path.isdir(p): shutil.rmtree(p)
-   except OSError: pass
+ for p in glob.glob(os.path.join(tempfile.gettempdir(),"titella-bootstrap-*")):
+  try:
+   if now-os.stat(p).st_mtime>86400 and os.path.isdir(p): shutil.rmtree(p)
+  except OSError: pass
+def cbwr(t):
+ try: return subprocess.run(CBC,input=t.encode(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5).returncode==0
+ except Exception: return False
+def cbrd():
+ try: return subprocess.run(CBP,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=5).stdout.decode("utf-8","replace")
+ except Exception: return None
+def cbflush():
+ global CBSEQ,CBACK,CBLASTPKT
+ if CBOUT: CBSEQ+=1;t="TITELLA_S2M:"+L+":"+str(CBSEQ)+":"+str(CBLAST)+"\n"+"\n".join(CBOUT)+"\n"
+ elif CBACK and CBLAST: t="TITELLA_S2M:"+L+":0:"+str(CBLAST)+"\n"
+ else: return
+ if cbwr(t): del CBOUT[:];CBACK=False;CBLASTPKT=t
+def hframe(f):
+ global rid,rop,meta,partial,out,expected
+ typ=f.get("type");frid=f.get("request_id");fop=f.get("op");body=f.get("body") or {}
+ if typ=="request" and fop=="begin":
+  rid=frid;rop=fop;meta=body;partial=os.path.join(root,".payload.pyz.part");out=open(partial,"wb");expected=0
+  send("bootstrap","response",request_id=frid,op=fop,body={"status":"ready","session_id":S});rid=rop=None
+ elif typ=="data" and f.get("session_id")==S and out is not None:
+  seq=int(f.get("seq",-1))
+  if seq==expected: out.write(base64.b64decode(f["data_b64"],validate=True));expected+=1
+  if seq<=expected: send("bootstrap","ack",session_id=S,ack_seq=seq)
+ elif typ=="request" and fop=="commit" and out is not None:
+  rid=frid;rop=fop;out.close();out=None;data=open(partial,"rb").read()
+  if len(data)!=int(meta["size"]): raise RuntimeError("size_mismatch")
+  if hashlib.sha256(data).hexdigest()!=meta["sha256"]: raise RuntimeError("checksum_mismatch")
+  final=os.path.join(root,".payload.pyz");os.replace(partial,final);os.chmod(final,0o700)
+  send("bootstrap","response",request_id=frid,op=fop,body={"status":"started","size":len(data),"sha256":meta["sha256"]});rid=rop=None
+  if CB: cbflush()
+  subprocess.Popen([sys.executable,final,"--port",("CLIPBOARD" if CB else port),"--link-id",L,"--bootstrap-dir",root],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,close_fds=True)
+  time.sleep(.5);sys.exit(0)
 try:
  if sys.version_info<(3,9): raise RuntimeError("python_unavailable")
- cleanup_old()
- if globals().get("fd") is None:
-  fd=None
-  for port in candidates():
-   try: fd=rawopen(port);break
-   except OSError: pass
+ cleanup_old();CB=str(P or "").upper()=="CLIPBOARD"
+ if CB:
+  for r,w in (("pbpaste","pbcopy"),("wl-paste","wl-copy")):
+   if shutil.which(r) and shutil.which(w): CBP=[shutil.which(r)];CBC=[shutil.which(w)];break
+  else:
+   x=shutil.which("xclip")
+   if x: CBP=[x,"-selection","clipboard","-o"];CBC=[x,"-selection","clipboard"]
+  if not CBP: raise RuntimeError("clipboard_unavailable")
  else:
-  # The typed stub already opened the CDC and is waiting for this loader:
-  # reusing that descriptor keeps the port opened once per bootstrap.
-  port=globals().get("port")
- if fd is None: raise RuntimeError("cdc_not_found")
+  if globals().get("fd") is None:
+   fd=None
+   for port in candidates():
+    try: fd=rawopen(port);break
+    except OSError: pass
+  else: port=globals().get("port")
+  if fd is None: raise RuntimeError("cdc_not_found")
  root=tempfile.mkdtemp(prefix=".");os.chmod(root,0o700)
  send("bootstrap","event",session_id=S,op="loader.ready",body={"python":sys.version.split()[0]})
  buf=b"";overflow=False;meta=None;out=None;expected=0;deadline=time.monotonic()+180
+ if CB:
+  last=None
+  while time.monotonic()<deadline:
+   text=cbrd()
+   if text is not None and text!=last:
+    last=text
+    if text.startswith("TITELLA_M2S:"+L+":"):
+     head,_,body=text.partition("\n");parts=head.strip().split(":")
+     if len(parts)==4:
+      try: m2s=int(parts[2])
+      except ValueError: m2s=-1
+      if m2s>CBLAST:
+       CBLAST=m2s;CBBUSY=True
+       try:
+        for ln in body.split("\n"):
+         ln=ln.rstrip("\r")
+         if not ln or len(ln)>4096: continue
+         try: f=json.loads(ln)
+         except Exception: continue
+         if f.get("v")==1 and f.get("link_id")==L and f.get("channel")=="bootstrap": hframe(f)
+       finally: CBBUSY=False
+       if not CBOUT: CBACK=True
+       cbflush()
+      elif m2s==CBLAST and m2s>0 and CBLASTPKT: cbwr(CBLASTPKT)
+   if CBOUT or CBACK: cbflush()
+   time.sleep(.02)
+  raise RuntimeError("bootstrap_timeout")
  while time.monotonic()<deadline:
   r,_,_=select.select([fd],[],[],1)
   if not r: continue
@@ -52,8 +114,6 @@ try:
   while True:
    nl=buf.find(b"\n")
    if nl<0:
-    # Bounded framing: a line over the protocol maximum is dropped whole and
-    # the reader resynchronizes on the next LF instead of growing without limit.
     if len(buf)>4097: overflow=True;buf=b""
     break
    line=buf[:nl];buf=buf[nl+1:]
@@ -62,34 +122,14 @@ try:
    try: f=json.loads(line)
    except Exception: continue
    if f.get("v")!=1 or f.get("link_id")!=L or f.get("channel")!="bootstrap": continue
-   typ=f.get("type");frid=f.get("request_id");fop=f.get("op");body=f.get("body") or {}
-   if typ=="request" and fop=="begin":
-    rid=frid;rop=fop
-    meta=body;partial=os.path.join(root,".payload.pyz.part");out=open(partial,"wb");expected=0
-    send("bootstrap","response",request_id=frid,op=fop,body={"status":"ready","session_id":S})
-    rid=None;rop=None
-   elif typ=="data" and f.get("session_id")==S and out is not None:
-    seq=int(f.get("seq",-1))
-    if seq==expected: out.write(base64.b64decode(f["data_b64"],validate=True));expected+=1
-    if seq<=expected: send("bootstrap","ack",session_id=S,ack_seq=seq)
-   elif typ=="request" and fop=="commit" and out is not None:
-    rid=frid;rop=fop
-    out.close();out=None;data=open(partial,"rb").read()
-    if len(data)!=int(meta["size"]): raise RuntimeError("size_mismatch")
-    if hashlib.sha256(data).hexdigest()!=meta["sha256"]: raise RuntimeError("checksum_mismatch")
-    final=os.path.join(root,".payload.pyz");os.replace(partial,final);os.chmod(final,0o700)
-    send("bootstrap","response",request_id=frid,op=fop,body={"status":"started","size":len(data),"sha256":meta["sha256"]})
-    rid=None;rop=None
-    subprocess.Popen([sys.executable,final,"--port",port,"--link-id",L,"--bootstrap-dir",root],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,close_fds=True)
-    time.sleep(.5);sys.exit(0)
+   hframe(f)
  raise RuntimeError("bootstrap_timeout")
 except Exception as e:
  code=str(e) or "loader_failed"
  try:
-  # With a request in flight the error must carry request_id/op so that
-  # SerialLink.request() delivers it; if it fails earlier, session_id is enough.
   if rid is not None: send("bootstrap","error",request_id=rid,op=rop,body={"code":code,"message":code,"retryable":False})
   else: send("bootstrap","error",session_id=S,body={"code":code,"message":code,"retryable":False})
+  if CB: cbflush()
  except Exception: sys.stderr.write(code+"\n");sys.stderr.flush()
  try:
   if out: out.close()

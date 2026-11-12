@@ -47,6 +47,43 @@ If Python is missing or older than 3.9, the loader ends with
 `python_unavailable` before accepting the payload. It does not download
 runtimes or use Node, Java, or system packages as an alternative.
 
+**Clipboard rigs.** With `agent_protocol = "clipboard"` the master renders the
+sentinel `CLIPBOARD` where the CDC path would go, for a window rig where the
+slave shares no USB with the master. No CDC is opened: the loader and the agent
+carry the same v1 frames inside `TITELLA_S2M`/`TITELLA_M2S` clipboard packets.
+The clipboard tool is `pbcopy`/`pbpaste` on macOS, `wl-copy`/`wl-paste` on
+Wayland and `xclip` on X11; a host with none of them reports
+`clipboard_unavailable` rather than silently falling back to a CDC. The agent
+then starts with `--port CLIPBOARD`. Packet format, sequencing, idle silence and
+acknowledgement rules are in
+[the clipboard CDC section](serial-protocol.md#clipboard-cdc-agent_protocol--clipboard).
+
+## Screen capture
+
+`screen(source="agent")` captures the graphical session this agent runs in; it
+never touches the master's UVC grabber. What the slave needs depends on the
+session:
+
+| Session | Requirement | Missing requirement |
+|---|---|---|
+| macOS | Screen Recording granted to the application that launches the agent | `screen_permission_denied` (not retryable). Without it `screencapture` exits 1 with "could not create image from display"; the CoreGraphics preflight turns that into a named error before the tool runs |
+| X11 | ImageMagick (`import`), or `xwd` plus `convert`/`magick`/`ffmpeg` | `screen_unsupported` naming the tool to install, or `screen_unsupported` when `xwd` has no converter |
+| Wayland | `gdbus` (glib2) and a portal that supports `Screenshot` | `screen_unsupported` without `gdbus`; `screen_permission_denied` when the portal denies or cancels |
+
+On macOS the permission is granted per application, and macOS attributes it to
+the **responsible** process: an agent launched from Terminal inherits
+Terminal's grant, while the same code started by `launchd` — or any process
+with no responsible application — cannot capture even after the setting is
+enabled (measured on macOS 26: preflight `False`, `screencapture` exit 1). The
+loader starts the agent as a child of the shell it opened, so granting the
+terminal used for `slave_bootstrap` is what matters; re-granting does not
+require a new bootstrap, but the agent must be restarted.
+
+A Wayland compositor exposes no global framebuffer, so the portal is the only
+path and it may ask the user to confirm each capture. That is a property of the
+session, not a defect: the master reports the denial instead of an empty image.
+The response metadata names the `backend` that produced the frame.
+
 ## Flow
 
 1. `slave_bootstrap(owner, platform="macos"|"linux", layout=...,

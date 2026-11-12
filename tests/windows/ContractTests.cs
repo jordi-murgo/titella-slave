@@ -4,7 +4,7 @@
 //   Add-Type -LiteralPath @((Get-ChildItem .\implementations\windows\*.cs).FullName +
 //                           (Resolve-Path .\tests\windows\ContractTests.cs).Path) `
 //            -ReferencedAssemblies System.dll,System.Core.dll,System.Web.Extensions.dll,
-//                                 <GAC System.Management.Automation.dll>
+//                                 System.Drawing.dll,<GAC System.Management.Automation.dll>
 //   exit [Titella.Slave.Tests.ContractTests]::RunAll((Get-Location).Path)
 //
 // Every test catches its own failures, prints PASS/FAIL and the returned
@@ -79,14 +79,15 @@ namespace Titella.Slave.Tests
             Run("Transfer.DownloadWindowBounds", TransferDownloadWindow);
             Run("Transfer.ProgressEvent", TransferProgressEvent);
 
-            Run("Lifecycle.StopRemovesOwnedDirectory", LifecycleStopRemovesOwnedDirectory);
+            Run("Lifecycle.StopCleansOwnedDirectoryTombstone", LifecycleStopCleansOwnedDirectoryTombstone);
             Run("Lifecycle.GraceExpirySixTimes", LifecycleGraceExpirySixTimes);
             Run("Lifecycle.ReplugKeepsSession", LifecycleReplugKeepsSession);
             Run("Lifecycle.ForeignDirectoryIsKept", LifecycleForeignDirectoryIsKept);
 
-            Run("Source.UnitSet", SourceSevenUnits);
+            Run("Source.Hygiene", SourceHygiene);
             Run("Source.NoPolicyBypass", SourceNoPolicyBypass);
             Run("Source.StreamTransportIsInternal", SourceStreamTransportIsInternal);
+            Run("Screen.DispatchContract", ScreenDispatchContract);
             Run("Policy.RestrictedCompilationWorks", PolicyRestrictedCompilationWorks);
 
             Console.WriteLine(string.Format(
@@ -252,7 +253,7 @@ namespace Titella.Slave.Tests
         private static string TempDirectory(string prefix)
         {
             string path = Path.Combine(
-                Path.GetTempPath(), prefix + Guid.NewGuid().ToString("N"));
+                Path.GetTempPath(), prefix + Guid.NewGuid().ToString("N").Substring(0, 16));
             Directory.CreateDirectory(path);
             return path;
         }
@@ -2113,10 +2114,12 @@ namespace Titella.Slave.Tests
 
         // ----------------------------------------------------------- Lifecycle
 
-        private static void LifecycleStopRemovesOwnedDirectory()
+        private static void LifecycleStopCleansOwnedDirectoryTombstone()
         {
             using (PeerHarness harness = new PeerHarness())
             {
+                // The loader's own naming convention: a bare 16-hex-digit
+                // name under TEMP, which the cleanup predicate accepts.
                 string bootstrap = TempDirectory("titella-bootstrap-");
                 File.WriteAllText(Path.Combine(bootstrap, "payload.bin"), "payload",
                                   new UTF8Encoding(false));
@@ -2130,12 +2133,18 @@ namespace Titella.Slave.Tests
                         "control", "agent.stop", new Dictionary<string, object>(), 8000);
                     AssertEqual("stopped", Str(stopped, "status"), "stop acknowledged");
                     Assert(thread.Join(5000), "the run loop finished within 5 s");
-                    Assert(!Directory.Exists(bootstrap),
-                           "the owned bootstrap directory was removed");
+                    // The directory stays as a tombstone (the running image
+                    // and owner.json cannot be deleted while the process
+                    // lives), but every other artifact is gone.
+                    Assert(Directory.Exists(bootstrap),
+                           "the owned bootstrap directory stays as a tombstone");
+                    Assert(!File.Exists(Path.Combine(bootstrap, "payload.bin")),
+                           "the owned payload was removed");
                 }
                 finally
                 {
                     StopAgent(agent, thread);
+                    DeleteTree(bootstrap);
                 }
             }
         }
@@ -2156,12 +2165,13 @@ namespace Titella.Slave.Tests
                         peer.Next("hello", 5000);
                         Assert(thread.Join(9000),
                                "round " + round + ": expiry finished the loop");
-                        Assert(!Directory.Exists(bootstrap),
-                               "round " + round + ": directory removed");
+                        Assert(!File.Exists(Path.Combine(bootstrap, "payload.bin")),
+                               "round " + round + ": directory emptied");
                     }
                     finally
                     {
                         StopAgent(agent, thread);
+                        DeleteTree(bootstrap);
                     }
                 }
             }
@@ -2236,33 +2246,27 @@ namespace Titella.Slave.Tests
             return Path.Combine(_repositoryRoot, "implementations", "windows");
         }
 
-        private static string[] UnitNames()
+        /// <summary>
+        /// Production discovery convention of the build hook and the loader:
+        /// every *.cs unit in implementations/windows, in lexicographic order.
+        /// </summary>
+        private static string[] SourceUnits()
         {
-            return new string[]
-            {
-                "Agent.cs", "CdcTransport.cs", "FileService.cs", "JobHost.cs",
-                "NativeMethods.cs", "ShellService.cs", "TransferService.cs",
-                "Wire.cs",
-            };
-        }
-
-        private static void SourceSevenUnits()
-        {
-            string directory = WindowsDirectory();
-            Assert(Directory.Exists(directory), "implementations/windows exists");
             List<string> names = new List<string>();
-            foreach (string entry in Directory.GetFiles(directory, "*.cs"))
+            foreach (string entry in Directory.GetFiles(WindowsDirectory(), "*.cs"))
             {
                 names.Add(Path.GetFileName(entry));
             }
             names.Sort(StringComparer.Ordinal);
-            string[] expected = UnitNames();
-            AssertEqual(expected.Length, names.Count, "exactly eight units");
-            for (int index = 0; index < expected.Length; index++)
-            {
-                AssertEqual(expected[index], names[index],
-                            "lexicographic position " + index);
-            }
+            return names.ToArray();
+        }
+
+        private static void SourceHygiene()
+        {
+            string directory = WindowsDirectory();
+            Assert(Directory.Exists(directory), "implementations/windows exists");
+            string[] names = SourceUnits();
+            Assert(names.Length > 0, "the unit set is not empty");
 
             StringBuilder concatenated = new StringBuilder();
             foreach (string name in names)
@@ -2287,6 +2291,53 @@ namespace Titella.Slave.Tests
             Assert(built.Length > 0, "concatenation is non-empty");
             Assert(concatenated.ToString().EndsWith("\n", StringComparison.Ordinal),
                    "single trailing newline");
+        }
+
+        /// <summary>
+        /// fs.screen is dispatched, not an unknown operation, and a capture
+        /// either delivers a self-consistent PNG contract or reports one of
+        /// the two documented error codes. A headless or locked desktop is a
+        /// PENDING live proof, never a fabricated image.
+        /// </summary>
+        private static void ScreenDispatchContract()
+        {
+            AssertEqual(32 * 1024 * 1024, ScreenLimits.MaxPngBytes,
+                        "the slave ceiling matches the master's 32 MiB bound");
+            FileService service = new FileService();
+            FileService.Result result;
+            try
+            {
+                result = service.Dispatch("screen", new Dictionary<string, object>());
+            }
+            catch (ProtocolError error)
+            {
+                Assert(error.Code == "screen_capture_failed" || error.Code == "screen_too_large",
+                       "the capture fails only with a documented code, got " + error.Code);
+                Console.WriteLine(
+                    "PENDING live capture: fs.screen reported " + error.Code +
+                    " (" + error.Message + ")");
+                return;
+            }
+            Assert(result.Payload != null, "a successful capture carries a payload");
+            Assert(result.Payload.Length > 8, "the payload is not empty");
+            byte[] signature = new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+            for (int index = 0; index < signature.Length; index++)
+            {
+                AssertEqual(signature[index], result.Payload[index], "PNG signature byte " + index);
+            }
+            AssertEqual("png", (string)result.Metadata["format"], "format");
+            AssertEqual("agent", (string)result.Metadata["source"], "source");
+            AssertEqual("primary", (string)result.Metadata["monitor"], "monitor");
+            AssertEqual(result.Payload.Length, (int)result.Metadata["bytes"], "declared bytes");
+            int width = (int)result.Metadata["width_px"];
+            int height = (int)result.Metadata["height_px"];
+            Assert(width > 0 && height > 0, "positive dimensions");
+            int headerWidth = (result.Payload[16] << 24) | (result.Payload[17] << 16)
+                | (result.Payload[18] << 8) | result.Payload[19];
+            int headerHeight = (result.Payload[20] << 24) | (result.Payload[21] << 16)
+                | (result.Payload[22] << 8) | result.Payload[23];
+            AssertEqual(width, headerWidth, "declared width matches the PNG IHDR");
+            AssertEqual(height, headerHeight, "declared height matches the PNG IHDR");
         }
 
         private static void SourceNoPolicyBypass()

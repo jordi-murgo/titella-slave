@@ -44,27 +44,52 @@ def _entry(payload_name: str, loader_name: str, payload: bytes,
     }
 
 
+HID_STAGE0 = b"# hid stage0\n__HID_TOKEN__ __HID_SIZE__ __HID_SHA256__\n"
+HID_TRANSPORT = b"// hid transport unit\n"
+
+
+def _hid_bootstrap(stage0: bytes = HID_STAGE0,
+                   transport: bytes = HID_TRANSPORT) -> dict[str, object]:
+    """The Windows ``hid_bootstrap`` block, hashes derived from the real bytes."""
+    return {
+        "stage0": build_support.WINDOWS_HID_STAGE0_NAME,
+        "stage0_sha256": hashlib.sha256(stage0).hexdigest(),
+        "transport": build_support.WINDOWS_HID_TRANSPORT_NAME,
+        "transport_sha256": hashlib.sha256(transport).hexdigest(),
+    }
+
+
 def _manifest_for(python_payload: bytes, windows_payload: bytes,
                   loader: bytes = b"# loader\n",
-                  windows_loader: bytes = b"# windows loader\n") -> dict[str, object]:
+                  windows_loader: bytes = b"# windows loader\n",
+                  hid_stage0: bytes = HID_STAGE0,
+                  hid_transport: bytes = HID_TRANSPORT) -> dict[str, object]:
+    windows = _entry("titella-slave.cs", "windows.ps1.tmpl",
+                     windows_payload, windows_loader)
+    windows["hid_bootstrap"] = _hid_bootstrap(hid_stage0, hid_transport)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "protocol": 1,
         "version": __version__,
         "implementations": {
             "python": _entry("titella-slave.pyz", "python.py.tmpl",
                              python_payload, loader),
-            "windows-dotnet": _entry("titella-slave.cs", "windows.ps1.tmpl",
-                                      windows_payload, windows_loader),
+            "windows-dotnet": windows,
         },
     }
 
 
 def _data_dir_with(case: unittest.TestCase, manifest: dict[str, object],
-                   payload: bytes, loader: bytes = b"# loader\n") -> Path:
+                   payload: bytes, loader: bytes = b"# loader\n",
+                   windows_payload: bytes = b"// cs",
+                   hid_stage0: bytes = HID_STAGE0,
+                   hid_transport: bytes = HID_TRANSPORT) -> Path:
     """A synthetic installed ``_data`` directory described by ``manifest``.
 
-    The directory is removed with the test case; no state survives a run.
+    Artifacts are written under their canonical packaged names; a test that
+    needs a malformed name rewrites ``manifest.json`` afterwards, so no path
+    ever escapes this temporary directory. The directory is removed with the
+    test case; no state survives a run.
     """
     directory = Path(tempfile.mkdtemp(prefix="titella-bundle-"))
     case.addCleanup(shutil.rmtree, directory, ignore_errors=True)
@@ -73,8 +98,10 @@ def _data_dir_with(case: unittest.TestCase, manifest: dict[str, object],
     (directory / entry["loader"]).write_bytes(loader)
     if "windows-dotnet" in manifest["implementations"]:
         windows = manifest["implementations"]["windows-dotnet"]
-        (directory / windows["payload"]).write_bytes(b"// windows unit")
+        (directory / windows["payload"]).write_bytes(windows_payload)
         (directory / windows["loader"]).write_bytes(b"# windows loader\n")
+        (directory / build_support.WINDOWS_HID_STAGE0_NAME).write_bytes(hid_stage0)
+        (directory / build_support.WINDOWS_HID_TRANSPORT_NAME).write_bytes(hid_transport)
     (directory / "manifest.json").write_text(
         json.dumps(manifest), encoding="utf-8"
     )
@@ -163,6 +190,12 @@ class BuildDeterminismTests(unittest.TestCase):
         self.assertTrue(data.endswith(b"\n"))
         order = [path.name for path in build_support.windows_sources(ROOT)]
         self.assertEqual(order, sorted(order))
+        # The csc /main of the loader names Titella.Slave.AgentHost, so the
+        # entry unit must exist and stay in the concatenation order.
+        self.assertIn("AgentHost.cs", order)
+        self.assertLess(order.index("Agent.cs"), order.index("AgentHost.cs"))
+        self.assertLess(order.index("AgentHost.cs"), order.index("CdcTransport.cs"))
+        self.assertIn(b"public static int Main(string[] args)", data)
 
     def test_missing_windows_sources_are_reported_honestly(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -199,10 +232,14 @@ class BuildDeterminismTests(unittest.TestCase):
             self.assertIn(placeholder, text)
         for forbidden in ("ExecutionPolicy Bypass", "Unblock-File", "-WindowStyle Hidden"):
             self.assertNotIn(forbidden, text)
-        # The payload is compiled with Add-Type in a detached child, never
-        # invoked as a .ps1 file with -File.
-        self.assertIn("-EncodedCommand", text)
-        self.assertIn("Add-Type -LiteralPath", text)
+        # The payload is compiled to agent.exe with the framework's own csc
+        # and started directly: no powershell.exe child, no Add-Type payload
+        # compile, no -EncodedCommand, never invoked as a .ps1 file with -File.
+        self.assertIn("csc.exe", text)
+        self.assertIn("/target:exe", text)
+        self.assertIn("/main:Titella.Slave.AgentHost", text)
+        self.assertIn("agent.json", text)
+        self.assertNotIn("-EncodedCommand", text)
         self.assertNotIn("-File ", text)
         self.assertIn("FreeConsole", build_support.build_windows_source(ROOT).decode("utf-8"))
 
@@ -214,7 +251,7 @@ class BuildDeterminismTests(unittest.TestCase):
             manifest = json.loads(
                 (data_dir / "manifest.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(manifest["schema_version"], 1)
+            self.assertEqual(manifest["schema_version"], 2)
             self.assertEqual(manifest["protocol"], 1)
             self.assertEqual(manifest["version"], __version__)
             self.assertEqual(
@@ -230,9 +267,42 @@ class BuildDeterminismTests(unittest.TestCase):
                 self.assertEqual(
                     entry["loader_sha256"], hashlib.sha256(loader).hexdigest()
                 )
+            windows = manifest["implementations"]["windows-dotnet"]
+            self.assertEqual(
+                set(windows["hid_bootstrap"]),
+                set(bundles.HID_BOOTSTRAP_KEYS),
+            )
+            bootstrap = windows["hid_bootstrap"]
+            stage0 = (data_dir / bootstrap["stage0"]).read_bytes()
+            transport = (data_dir / bootstrap["transport"]).read_bytes()
+            self.assertEqual(
+                bootstrap["stage0_sha256"], hashlib.sha256(stage0).hexdigest()
+            )
+            self.assertEqual(
+                bootstrap["transport_sha256"], hashlib.sha256(transport).hexdigest()
+            )
+            self.assertNotIn("hid_bootstrap", manifest["implementations"]["python"])
             first = (data_dir / "manifest.json").read_bytes()
             build_support.write_bundle_assets(ROOT, data_dir)
             self.assertEqual(first, (data_dir / "manifest.json").read_bytes())
+
+    def test_missing_or_oversized_hid_inputs_fail_the_build(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with self.assertRaises(build_support.TitellaBuildError) as raised:
+                build_support.loader_bytes(root, build_support.WINDOWS_HID_STAGE0_NAME)
+            self.assertEqual(raised.exception.code, "loader_missing")
+            with self.assertRaises(build_support.TitellaBuildError) as raised:
+                build_support.hid_transport_source(root)
+            self.assertEqual(raised.exception.code, "hid_transport_missing")
+            # An oversized artifact is refused at build time, not shipped and
+            # truncated later by the bundle reader.
+            with self.assertRaises(build_support.TitellaBuildError) as raised:
+                build_support._require_hid_artifact(
+                    "windows-hid-transport.cs",
+                    b"x" * (build_support.MAX_HID_ARTIFACT_BYTES + 1),
+                )
+            self.assertEqual(raised.exception.code, "hid_artifact_too_large")
 
 
     def test_python_loader_has_no_product_fallback_and_no_env_port_channel(self) -> None:
@@ -277,6 +347,9 @@ class BundleValidationTests(unittest.TestCase):
         self.assertEqual(bundle.payload, payload)
         self.assertEqual(bundle.sha256, hashlib.sha256(payload).hexdigest())
         self.assertEqual(bundle.loader_source, "# loader\n")
+        # Python has no HID transport: schema 2 keeps both fields None.
+        self.assertIsNone(bundle.hid_stage0_source)
+        self.assertIsNone(bundle.hid_transport_source)
         self.assertIsInstance(bundle, bundles.SlaveBundle)
 
     def test_bundle_is_immutable(self) -> None:
@@ -418,6 +491,133 @@ class BundleValidationTests(unittest.TestCase):
         with self.assertRaises(bundles.BundleError) as raised:
             bundles._load_from(data_dir, "python")
         self.assertEqual(raised.exception.code, bundles.BUNDLE_INCOMPATIBLE)
+
+    def test_schema_one_manifest_is_rejected(self) -> None:
+        """Clean cutover: schema 1 is not accepted in parallel."""
+        payload = b"payload-bytes"
+        manifest = _manifest_for(payload, b"// cs")
+        manifest["schema_version"] = 1
+        data_dir = _data_dir_with(self, manifest, payload)
+        with self.assertRaises(bundles.BundleError) as raised:
+            bundles._load_from(data_dir, "windows-dotnet")
+        self.assertEqual(raised.exception.code, bundles.BUNDLE_INCOMPATIBLE)
+
+
+class HidBootstrapValidationTests(unittest.TestCase):
+    """Schema 2: the Windows bundle must carry both validated HID artifacts."""
+
+    def test_missing_hid_bootstrap_block_is_invalid(self) -> None:
+        payload = b"payload-bytes"
+        manifest = _manifest_for(payload, b"// cs")
+        del manifest["implementations"]["windows-dotnet"]["hid_bootstrap"]
+        data_dir = _data_dir_with(self, manifest, payload)
+        with self.assertRaises(bundles.BundleError) as raised:
+            bundles._load_from(data_dir, "windows-dotnet")
+        self.assertEqual(raised.exception.code, bundles.BUNDLE_INVALID)
+
+    def test_hid_bootstrap_block_must_have_exactly_the_contract_keys(self) -> None:
+        payload = b"payload-bytes"
+        # Omitting one contract key fails like a schema violation.
+        manifest = _manifest_for(payload, b"// cs")
+        del manifest["implementations"]["windows-dotnet"]["hid_bootstrap"]["stage0_sha256"]
+        data_dir = _data_dir_with(self, manifest, payload)
+        with self.assertRaises(bundles.BundleError) as raised:
+            bundles._load_from(data_dir, "windows-dotnet")
+        self.assertEqual(raised.exception.code, bundles.BUNDLE_INVALID)
+        # An extra key is equally malformed: the block is fixed, not open.
+        manifest = _manifest_for(payload, b"// cs")
+        manifest["implementations"]["windows-dotnet"]["hid_bootstrap"]["extra"] = "x"
+        data_dir = _data_dir_with(self, manifest, payload)
+        with self.assertRaises(bundles.BundleError) as raised:
+            bundles._load_from(data_dir, "windows-dotnet")
+        self.assertEqual(raised.exception.code, bundles.BUNDLE_INVALID)
+
+    def test_malformed_hid_hashes_are_invalid(self) -> None:
+        payload = b"payload-bytes"
+        for key in ("stage0_sha256", "transport_sha256"):
+            manifest = _manifest_for(payload, b"// cs")
+            manifest["implementations"]["windows-dotnet"]["hid_bootstrap"][key] = "0" * 63
+            data_dir = _data_dir_with(self, manifest, payload)
+            with self.assertRaises(bundles.BundleError) as raised:
+                bundles._load_from(data_dir, "windows-dotnet")
+            self.assertEqual(raised.exception.code, bundles.BUNDLE_INVALID)
+
+    def test_tampered_hid_stage0_hash_is_invalid(self) -> None:
+        payload = b"payload-bytes"
+        manifest = _manifest_for(payload, b"// cs")
+        manifest["implementations"]["windows-dotnet"]["hid_bootstrap"]["stage0_sha256"] = "0" * 64
+        data_dir = _data_dir_with(self, manifest, payload)
+        with self.assertRaises(bundles.BundleError) as raised:
+            bundles._load_from(data_dir, "windows-dotnet")
+        self.assertEqual(raised.exception.code, bundles.BUNDLE_INVALID)
+
+    def test_tampered_hid_transport_hash_is_invalid(self) -> None:
+        payload = b"payload-bytes"
+        manifest = _manifest_for(payload, b"// cs")
+        manifest["implementations"]["windows-dotnet"]["hid_bootstrap"]["transport_sha256"] = "0" * 64
+        data_dir = _data_dir_with(self, manifest, payload)
+        with self.assertRaises(bundles.BundleError) as raised:
+            bundles._load_from(data_dir, "windows-dotnet")
+        self.assertEqual(raised.exception.code, bundles.BUNDLE_INVALID)
+
+    def test_absent_hid_artifacts_report_missing(self) -> None:
+        payload = b"payload-bytes"
+        for member in (build_support.WINDOWS_HID_STAGE0_NAME,
+                       build_support.WINDOWS_HID_TRANSPORT_NAME):
+            data_dir = _data_dir_with(self, _manifest_for(payload, b"// cs"), payload)
+            (data_dir / member).unlink()
+            with self.assertRaises(bundles.BundleError) as raised:
+                bundles._load_from(data_dir, "windows-dotnet")
+            self.assertEqual(raised.exception.code, bundles.BUNDLE_MISSING)
+
+    def test_unsafe_hid_artifact_names_are_invalid(self) -> None:
+        payload = b"payload-bytes"
+        for name in ("../escape.cs", "/etc/passwd", "a\\b"):
+            manifest = _manifest_for(payload, b"// cs")
+            manifest["implementations"]["windows-dotnet"]["hid_bootstrap"]["transport"] = name
+            data_dir = _data_dir_with(self, manifest, payload)
+            with self.assertRaises(bundles.BundleError) as raised:
+                bundles._load_from(data_dir, "windows-dotnet")
+            self.assertEqual(raised.exception.code, bundles.BUNDLE_INVALID)
+
+    def test_non_utf8_hid_artifact_is_invalid(self) -> None:
+        payload = b"payload-bytes"
+        invalid = b"\xff\xfe not utf-8"
+        manifest = _manifest_for(payload, b"// cs", hid_stage0=invalid)
+        data_dir = _data_dir_with(
+            self, manifest, payload, hid_stage0=invalid,
+        )
+        with self.assertRaises(bundles.BundleError) as raised:
+            bundles._load_from(data_dir, "windows-dotnet")
+        self.assertEqual(raised.exception.code, bundles.BUNDLE_INVALID)
+
+    def test_hid_artifact_size_bound_is_enforced(self) -> None:
+        """64 KiB is the boundary: exactly at it loads, one byte over fails."""
+        payload = b"payload-bytes"
+        at_limit = b"a" * bundles.MAX_HID_ARTIFACT_BYTES
+        manifest = _manifest_for(payload, b"// cs", hid_transport=at_limit)
+        data_dir = _data_dir_with(
+            self, manifest, payload, hid_transport=at_limit,
+        )
+        bundle = bundles._load_from(data_dir, "windows-dotnet")
+        self.assertEqual(len(bundle.hid_transport_source), bundles.MAX_HID_ARTIFACT_BYTES)
+        over_limit = b"a" * (bundles.MAX_HID_ARTIFACT_BYTES + 1)
+        manifest = _manifest_for(payload, b"// cs", hid_transport=over_limit)
+        data_dir = _data_dir_with(
+            self, manifest, payload, hid_transport=over_limit,
+        )
+        with self.assertRaises(bundles.BundleError) as raised:
+            bundles._load_from(data_dir, "windows-dotnet")
+        self.assertEqual(raised.exception.code, bundles.BUNDLE_INVALID)
+
+    def test_python_entry_must_not_carry_hid_bootstrap(self) -> None:
+        payload = b"payload-bytes"
+        manifest = _manifest_for(payload, b"// cs")
+        manifest["implementations"]["python"]["hid_bootstrap"] = _hid_bootstrap()
+        data_dir = _data_dir_with(self, manifest, payload)
+        with self.assertRaises(bundles.BundleError) as raised:
+            bundles._load_from(data_dir, "python")
+        self.assertEqual(raised.exception.code, bundles.BUNDLE_INVALID)
 
 
 class ManifestPathSafetyTests(unittest.TestCase):

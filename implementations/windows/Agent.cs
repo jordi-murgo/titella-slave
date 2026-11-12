@@ -50,16 +50,44 @@ namespace Titella.Slave
                 }
             }
 
+            if (!string.IsNullOrEmpty(bootstrapDirectory))
+            {
+                try
+                {
+                    // Ownership marker of this bootstrap directory: the
+                    // loader writes it with the console pid, the agent takes
+                    // it over here, and the next bootstrap's sweep deletes
+                    // the tombstone once this pid is gone.
+                    File.WriteAllText(
+                        Path.Combine(bootstrapDirectory, "owner.json"),
+                        string.Format(
+                            CultureInfo.InvariantCulture,
+                            "{{\"session_id\":\"{0}\",\"pid\":{1}}}",
+                            linkId, ProcessId),
+                        new UTF8Encoding(false));
+                }
+                catch (Exception)
+                {
+                    // A marker that cannot be written never blocks the run.
+                }
+            }
+
             if (!WireConstants.IsLinkId(linkId))
             {
                 Log(logPath, "invalid link_id: 32 lowercase hexadecimal characters are required");
                 return 2;
             }
-            if (!ComTransport.IsValidPortName(port))
+            // The window rig renders the CLIPBOARD sentinel instead of a COM
+            // port: the same protocol then runs over the shared clipboard.
+            // Native USB rigs render HID:<serial> instead: the same protocol
+            // then runs over the vendor data collection of that device.
+            bool clipboardPort = ClipboardTransport.IsClipboardPort(port);
+            bool hidPort = HidTransport.IsHidBinding(port);
+            if (!clipboardPort && !hidPort && !ComTransport.IsValidPortName(port))
             {
                 Log(logPath, string.IsNullOrEmpty(port)
                     ? "cdc_not_provided: the loader must resolve the COM port first"
-                    : "invalid cdc port: COM[1-9][0-9]* is required");
+                    : "invalid cdc port: COM[1-9][0-9]*, CLIPBOARD or HID:<serial> is required");
                 return 2;
             }
 
@@ -74,6 +102,18 @@ namespace Titella.Slave
                     linkId,
                     delegate()
                     {
+                        if (clipboardPort)
+                        {
+                            ClipboardTransport clipboard = new ClipboardTransport(linkId);
+                            clipboard.Open();
+                            return clipboard;
+                        }
+                        if (hidPort)
+                        {
+                            HidTransport hid = new HidTransport(resolvedPort);
+                            hid.Open();
+                            return hid;
+                        }
                         ComTransport transport = new ComTransport(resolvedPort);
                         transport.Open();
                         return transport;
@@ -117,6 +157,14 @@ namespace Titella.Slave
             }
         }
 
+        private static int ProcessId
+        {
+            get
+            {
+                return System.Diagnostics.Process.GetCurrentProcess().Id;
+            }
+        }
+
         /// <summary>
         /// Version of the installed .NET Framework 4.x, read from the registry
         /// value the framework writes (never Environment.Version, which is the
@@ -138,11 +186,10 @@ namespace Titella.Slave
             }
         }
         /// <summary>
-        /// Location of this compiled agent assembly: job children load it
-        /// to boot the in-process Runspace runner. When the agent is
-        /// hosted by powershell.exe (Add-Type compiled the source in the
-        /// current process) this is the temporary assembly produced by the
-        /// compiler, which is still loadable by child processes.
+        /// Location of the compiled agent executable (agent.exe): job
+        /// children are this very image started with --job. When the agent
+        /// is hosted in a test process the location is that host, which is
+        /// still the image the job children run.
         /// </summary>
         internal static string ExecutableAssembly()
         {
@@ -169,6 +216,14 @@ namespace Titella.Slave
         private readonly TerminalManager _terminals;
         private readonly FileService _files = new FileService();
         private readonly TransferService _transfers;
+        // Screenshot blocks in flight. 8 is the transfer channel's default and
+        // measured fastest here: a 1.7 MiB stream took 35-55 s at 8 against
+        // 48-51 s at 2. Frames lost mid-flight are recovered by the per-block
+        // retransmit; the master additionally refuses to publish a payload
+        // whose byte count disagrees with the declared size, so a loss it
+        // cannot recover surfaces as a retryable screen_capture_failed instead
+        // of a corrupt image.
+        private const int ScreenWindow = WireConstants.DataWindowDefault;
         private bool _cleaned;
         private bool _bound;
         private ProtocolError _capabilityError;
@@ -291,10 +346,13 @@ namespace Titella.Slave
         }
 
         /// <summary>
-        /// Deletes only this agent's own bootstrap directory: the name must
+        /// Cleans only this agent's own bootstrap directory: the name must
         /// be a bare 16-hex-digit GUID segment and the parent must be the
-        /// user TEMP directory. Reparse points are unlinked, never
-        /// descended into, so a foreign target is never touched.
+        /// user TEMP directory. The running image (not deletable while the
+        /// process lives) and owner.json are kept as the tombstone the next
+        /// bootstrap's sweep removes; everything else is deleted. Reparse
+        /// points are unlinked, never descended into, so a foreign target is
+        /// never touched.
         /// </summary>
         private void RemoveOwnedBootstrap()
         {
@@ -317,7 +375,20 @@ namespace Titella.Slave
                 {
                     return;
                 }
-                DeleteTree(full);
+                string image = typeof(SlaveAgent).Assembly.Location;
+                foreach (string entry in Directory.GetFileSystemEntries(full))
+                {
+                    if (string.Equals(entry, image, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+                    if (string.Equals(Path.GetFileName(entry), "owner.json",
+                                      StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+                    DeleteTree(entry);
+                }
             }
             catch (Exception)
             {
@@ -576,7 +647,8 @@ namespace Titella.Slave
         private void Fs(IDictionary<string, object> frame)
         {
             IDictionary<string, object> body = Body(frame);
-            FileService.Result response = _files.Dispatch(Op(frame), body);
+            string op = Op(frame);
+            FileService.Result response = _files.Dispatch(op, body);
             string streamId = Str(body, "stream_id");
             if (string.IsNullOrEmpty(streamId))
             {
@@ -587,7 +659,19 @@ namespace Titella.Slave
                 response.Metadata["stream_id"] = streamId;
                 response.Metadata["payload_kind"] = "bytes";
                 _link.Response(frame, response.Metadata);
-                StartStream("fs", streamId, response.Payload, "fs.stream.finished");
+                if (op == "screen")
+                {
+                    // A screenshot is hundreds of KiB: it uses the windowed
+                    // sender the transfer channel already proved on this link
+                    // instead of stop-and-wait, which measured ~3.5 KiB/s.
+                    StartWindowedStream(
+                        "fs", streamId, response.Payload, "fs.stream.finished",
+                        ScreenWindow);
+                }
+                else
+                {
+                    StartStream("fs", streamId, response.Payload, "fs.stream.finished");
+                }
                 return;
             }
             string json = Json.Serialize(response.Metadata);
@@ -605,6 +689,65 @@ namespace Titella.Slave
             {
                 _link.Response(frame, response.Metadata);
             }
+        }
+
+        /// <summary>
+        /// Sends a payload with the sliding window of the transfer channel
+        /// (per-block ACK, bounded resends) instead of the stop-and-wait used
+        /// by the interactive fs streams. Measured on the rig: ~30-45 KiB/s
+        /// windowed against ~3.5 KiB/s stop-and-wait, the difference between a
+        /// screenshot that arrives inside the master deadline and one that
+        /// cannot.
+        /// </summary>
+        private void StartWindowedStream(string channel, string streamId, byte[] payload,
+                                         string finalOp, int window)
+        {
+            Thread thread = new Thread(delegate()
+            {
+                try
+                {
+                    int position = 0;
+                    Func<byte[]> readChunk = delegate()
+                    {
+                        if (position >= payload.Length)
+                        {
+                            return new byte[0];
+                        }
+                        int length = Math.Min(
+                            WireConstants.DataChunkBytes, payload.Length - position);
+                        byte[] chunk = new byte[length];
+                        Array.Copy(payload, position, chunk, 0, length);
+                        position += length;
+                        return chunk;
+                    };
+                    int sent = _link.StreamData(channel, streamId, readChunk, window, null, null);
+                    IDictionary<string, object> body = new Dictionary<string, object>();
+                    body["status"] = "finished";
+                    body["bytes"] = sent;
+                    body["window"] = window;
+                    _link.Event(channel, finalOp, streamId, body);
+                }
+                catch (Exception error)
+                {
+                    IDictionary<string, object> body = new Dictionary<string, object>();
+                    body["status"] = "error";
+                    body["code"] = "stream_failed";
+                    body["message"] = error.Message;
+                    body["retryable"] = true;
+                    try
+                    {
+                        _link.Event(channel, finalOp, streamId, body);
+                    }
+                    catch (Exception)
+                    {
+                        // The link may already be closing.
+                    }
+                }
+            });
+            thread.IsBackground = true;
+            string shortId = streamId.Length <= 8 ? streamId : streamId.Substring(0, 8);
+            thread.Name = "fs-window-" + shortId;
+            thread.Start();
         }
 
         private void StartStream(string channel, string streamId, byte[] payload,

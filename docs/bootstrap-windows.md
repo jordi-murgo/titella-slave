@@ -20,8 +20,9 @@ by the system PowerShell with the in-box .NET Framework compiler.
   unconfirmed layout with `slave_layout_required`, `invalid_argument` or
   `slave_layout_unconfirmed` before any keystroke; the configured
   `keyboard_layout` is never a fallback.
-- The ESP32-S3 native USB enumerated with product `Titella KVM` and serial
-  `TITELLA-...`.
+- The ESP32-S3 native USB enumerated with the project identity: vendor id
+  `0x17EF`, product id `0xA38F`, product `Titella KVM` and a serial of twelve
+  uppercase hexadecimal characters.
 
 The loader never changes the execution policy, never uses
 `-ExecutionPolicy Bypass`, never calls `Unblock-File`, never asks for
@@ -65,14 +66,14 @@ task or exclusion. If a policy blocks `FullLanguage`, the framework version or
    `$script:Sp` open, so the firmware stays 100 % stateless and `COMx` is
    opened only once in PowerShell.
 4. The loader checks its environment gates and resolves the CDC port. An
-   explicit `slave_cdc_port` always wins. Without one, only a port whose PnP
-   instance id carries the Espressif vendor id (`VID_303A`), the `TITELLA-`
-   serial or the `Titella KVM` product name is accepted: zero candidates is
-   `cdc_not_found`, several is `cdc_ambiguous`, and an unrelated COM device is
-   never opened or written to. Windows may label the CDC `USB Serial Device`
-   when no driver package carries the descriptor, so the friendly name alone
-   is not a reliable signal. The port is opened exclusively
-   (`CreateFileW("\\\\.\\COMx", shareMode=0)`), 115200 8N1, no flow control.
+   explicit `slave_cdc_port` always wins. Without one, only a present port
+   whose PnP instance id carries the project vendor/product pair
+   (`VID_17EF&PID_A38F`) is accepted: zero candidates is `cdc_not_found`,
+   several is `cdc_ambiguous`, and an unrelated COM device is never opened or
+   written to. Windows may label the CDC `USB Serial Device` when no driver
+   package carries the descriptor, so the friendly name alone is not a
+   reliable signal. The port is opened exclusively
+   (`CreateFileW("\\\\.\\COMx", shareMode=0)`), 2,000,000 8N1, no flow control.
    It reads frames with a bounded 4096-byte line buffer (4097-byte buffer,
    discard up to LF on overflow), not with an unbounded `ReadLine`.
 
@@ -83,21 +84,22 @@ task or exclusion. If a policy blocks `FullLanguage`, the framework version or
 5. The loader announces `loader.ready`. The master sends the payload in
    512-byte blocks with per-block ACK; duplicates are re-acknowledged but not
    applied twice, and gaps are never written or acknowledged.
-6. The loader verifies size and SHA-256, moves the payload in the bootstrap
-   directory, then starts a **detached child PowerShell** with
-   `-NoLogo -NoProfile -NonInteractive -EncodedCommand` and one short
-   command: `Add-Type -LiteralPath <payload.cs> -OutputAssembly <agent.dll>
-   -ReferencedAssemblies System.dll,System.Core.dll,System.Web.Extensions.dll,<GAC
-   System.Management.Automation.dll>` followed by
-   `[Reflection.Assembly]::LoadFrom(<agent.dll>)` and
-   `[Titella.Slave.Agent]::Run(...)`. The loader closes the CDC before that
-   child starts and the child reopens the same port. The on-disk DLL lets
-   every later job child load the compiled agent for the in-process
-   Runspace runner.
-7. The child compiles the payload and enters `Agent.Run`, which calls
+6. The loader verifies size and SHA-256 and moves the payload into the
+   bootstrap directory, then compiles it to **agent.exe** with the framework's
+   own `csc.exe` (`/target:exe /main:Titella.Slave.AgentHost`, the same
+   reference set the payload has always needed), deletes the source, writes
+   the fixed `agent.json` next to the executable and starts `agent.exe`
+   directly — no powershell.exe child, no `-EncodedCommand`, no script text
+   in any classic PowerShell log channel. A compile failure keeps
+   `agent-compile.err.log` and is reported through the loader's error flow.
+   The loader closes the CDC before the agent starts; the agent reopens the
+   same port.
+7. `agent.exe` reads `agent.json` and enters `Agent.Run`, which calls
    `FreeConsole`: closing the original console window does not stop the agent.
-   `Agent.Run` receives the bootstrap directory, the `link_id`, the resolved
-   port, a 5000 ms heartbeat and a 30000 ms grace window.
+   `agent.json` carries the bootstrap directory, the `link_id`, the resolved
+   port, a 5000 ms heartbeat and a 30000 ms grace window. Later job children
+   are the same executable started with `--job`, so a job's host is the agent
+   itself, never powershell.exe.
 8. The agent emits `control.hello` with `implementation: "windows-dotnet"`,
    `runtime: {name: "dotnet-framework", version: <NDP Version>}`,
    `python: null`, `uid: null`, the real `pid` and `agent: "titella-slave"`.
@@ -109,12 +111,26 @@ task or exclusion. If a policy blocks `FullLanguage`, the framework version or
 The override wins: `slave_cdc_port` (argument, then configuration) must match
 `COM[1-9][0-9]*`; anything else is `invalid_argument` before any keystroke.
 
-Without an override the loader inspects `Get-PnpDevice -Class Ports` and keeps
-the present ports whose own PnP instance id carries the Espressif vendor id
-(`VID_303A`), a `TITELLA-` serial or the `Titella KVM` product name. The vendor
-id is the durable signal: Windows labels the CDC `USB Serial Device` when no
-driver package carries the firmware descriptor, so a name-only match misses a
-healthy device.
+**Clipboard rigs.** With `agent_protocol = "clipboard"` the master renders the
+sentinel `CLIPBOARD` instead of a port. No COM port is resolved and no serial
+device is opened: the loader sends `loader.ready` and every later frame inside
+`TITELLA_S2M` packets written with `Set-Clipboard`, and polls `Get-Clipboard
+-Raw` every 20 ms for `TITELLA_M2S` packets, feeding each line through the same
+`begin`/`data`/`commit` handlers the serial path uses. One S2M packet carries
+all the acknowledgements produced by one master packet, and a re-asserted
+master packet puts the last S2M packet back on the clipboard. The commit
+response is written before the loader exits, and `Agent.Run` then receives
+`CLIPBOARD` as its port and opens the shared-clipboard transport. A host that
+defines `$script:CbRx`/`$script:CbTx` hooks keeps them: the loader prefers those
+over the cmdlets. Packet format, sequencing and acknowledgement rules are in
+[the clipboard CDC section](serial-protocol.md#clipboard-cdc-agent_protocol--clipboard).
+
+Without an override the loader inspects `Get-PnpDevice -PresentOnly -Class
+Ports` and keeps the present ports whose own PnP instance id carries the
+project vendor/product pair `VID_17EF&PID_A38F`. That pair is the durable
+signal: Windows labels the CDC `USB Serial Device` when no driver package
+carries the firmware descriptor, so a name-only match misses a healthy device,
+and the Espressif vendor id alone no longer identifies this rig.
 
 | Outcome | Result |
 |---|---|
@@ -131,11 +147,122 @@ If firmware changes the USB identity, Windows may assign a different COM
 number. Re-run the bootstrap with the current port; a stale override is
 reported honestly, not silently retried on another port.
 
+## HID data transport
+
+`slave_transport = "hid"` carries the same protocol v1 frames over the
+vendor-defined HID collection of the device instead of a COM port, the
+shared clipboard or the network. The binding the loader hands to
+`Agent.Run` is `HID:<serial>`: exactly the twelve uppercase hexadecimal
+characters of the USB serial number of the vendor data collection. The
+binding is never a COM port, an interface number or a friendly name.
+
+The transport unit (`HidByteStream`) is a full-duplex peer of the firmware
+endpoint. Frames travel in **report 0x10** reports of 64 bytes including
+the report ID: version, class (`OPEN`, `OPEN_ACK`, `DATA`, `ACK`, `CLOSE`),
+a non-zero `uint32` epoch that correlates one connection, a `uint16`
+sequence per direction and a payload of at most 54 bytes. One DATA report
+is in flight per direction; an acknowledgement is only sent after the
+receiver admitted every payload byte into its 8192-byte queue, so a full
+queue applies backpressure instead of losing or truncating data. Exact
+duplicates are re-acknowledged without being applied twice, out-of-sequence
+reports are dropped without an acknowledgement, control frames overtake
+data, and sequence numbers wrap modulo 65536. DATA and OPEN retransmit on a
+250 ms deadline with three retries before the link fails explicitly. A
+graceful close sends `CLOSE` for its own epoch; a stale epoch never touches
+the current session.
+
+Collection selection uses USB identity and capabilities, never enumeration
+order: `HidD_GetAttributes` must report VID `0x17EF` and PID `0xA38F`, the
+serial string must equal the binding, and `HidP_GetCaps` must report usage
+page `0xFF00`, usage `0x01` and 64-byte IN, OUT and Feature report lengths.
+Keyboard and mouse collections of the same device are ignored; a data
+collection with the right identity and wrong lengths is `hid_incompatible`.
+The device is opened with `FILE_FLAG_OVERLAPPED` and a non-inheritable
+handle, and a `Local\Titella.Hid.<serial>` mutex keeps a second consumer
+from opening the same collection.
+
+### USB-only bootstrap
+
+A HID rig has no CDC, no shared clipboard and no network reach, so the
+bootstrap types exactly one line and pulls everything else over USB:
+
+1. The master stages the compressed loader container in the firmware's
+   Feature 0x11 mailbox over the UART (`loader_stage_begin`,
+   `loader_stage_chunk`, `loader_stage_commit`): chunks of at most 512
+   bytes, at most 32768 committed bytes, SHA-256 checked at commit, and the
+   snapshot expires 180 s after commit. The container is the rendered
+   loader, the `#@#` marker and the `HidByteStream` unit as raw UTF-8: no
+   Base64 transport source is ever registered as script text.
+2. The master types the stage-0 line — at most 3328 characters (~26.6 s of
+   pacing), gzip+base64 of the rendered
+   `loaders/windows-hid-stage0.ps1.tmpl` — into the prepared console. The
+   stage-0 loader enumerates the present HID interfaces with SetupDi and
+   keeps only paths carrying the rig identity (VID `0x17EF`, PID `0xA38F`);
+   it admits the one whose metadata answers the expected token, version and
+   size, downloads the snapshot in 44-byte blocks (four attempts per block,
+   30 s budget), verifies SHA-256 **before** decompressing, splits the
+   container on `#@#`, compiles the `HidByteStream` unit from a temporary
+   file (`Add-Type` registers the path, not the unit text) and runs the
+   loader part in the same console. It never spawns a process, reads the
+   clipboard or opens a COM port.
+3. The loader reuses the precompiled `HidByteStream` type, opens
+   `HID:<serial>`, announces `loader.ready` over the IN/OUT data transport
+   and receives `begin`/`data`/`commit` exactly as the CDC path does.
+4. On `commit` the loader disposes the stream (handle and mutex released) and
+   starts the detached agent process; the agent reopens the binding with a new
+   epoch. The loader returns to the console instead of exiting, so the same
+   window accepts another bootstrap, and a failed attempt also leaves it
+   alive.
+5. Before creating its own directory the loader sweeps tombstones of previous
+   bootstraps: a bare 16-hex-digit directory under TEMP that carries
+   `owner.json` naming a dead pid is deleted; anything else is never touched.
+   On stop the agent empties its directory except the running image and
+   `owner.json`, which only the next bootstrap's sweep can remove.
+
+The stage-0 helper only reads Feature reports of candidates whose metadata
+matches the staged snapshot; it never changes another device. A snapshot that
+exceeds 32768 bytes or a stage-0 line over 3328 characters fails the bootstrap
+before any keystroke.
+The CDC and clipboard rigs above keep their current behaviour; HID is selected
+per instance by configuration, never by an automatic fallback.
+
+A stopped HID agent is proven gone by `hid.health` reporting
+`slave_connected: false` for the destination the firmware currently forwards
+to — `cdc` or `hid` — never by a stop reply or its timeout: the transport may
+still be attached. Both values are meaningful: the HID endpoint closes with
+its epoch, and the core's CDC `operator bool` follows the host `DTR && RTS`
+line state (`_onLineState`), so it drops when the host closes the port rather
+than merely on unplug. The bootstrap waits for that state before it changes
+the firmware's destination or types anything, so a still-open stream — or an
+unobservable one — surfaces as `agent_stop_timeout` instead of a silent
+`hid_busy` later.
+
+| Code | Meaning |
+|---|---|
+| `invalid_argument` | The binding is not `HID:<12 uppercase hex>`. |
+| `hid_stage_not_found` | No reachable HID interface publishes the staged token and size. |
+| `hid_ambiguous` | Several HID devices publish the staged snapshot. |
+| `hid_stage_timeout` | The 30 s snapshot budget was exceeded. |
+| `hid_stage_failed` | A block exhausted its four attempts without a valid reply. |
+| `checksum_mismatch` | The downloaded snapshot does not match the declared SHA-256; nothing was executed. |
+| `hid_not_found` | No present HID data collection carries the serial. |
+| `hid_incompatible` | The collection does not expose 64-byte IN/OUT/Feature reports. |
+| `hid_busy` | Another Titella consumer holds the collection mutex. |
+| `hid_open_timeout` | The OPEN handshake did not complete within 1000 ms. |
+| `hid_retry_exhausted` | Three retries of OPEN or DATA went unanswered. |
+| `hid_write_timeout` | A native write did not complete within 250 ms. |
+| `hid_peer_closed` | The peer closed the current epoch. |
+| `hid_io_error` | The device failed while reading or writing reports. |
+| `hid_session_reset` | A new epoch discarded bytes that were still unacknowledged. |
+| `hid_closed` | The stream was disposed while a caller was blocked. |
+
 ## Timing
 
 | Stage | Wait |
 |---|---|
 | Launcher (Start search) and stub typing | 8 ms per character; each HID request is at most 256 characters. The stub is about 80 characters, so the typed stage is under a second. The loader arrives over the CDC. |
+| HID stage-0 line | At most 3072 characters at 8 ms per character: up to 24.576 s of character pacing, plus request overhead and execution. This is a budget, not a measured bootstrap time. |
+| HID snapshot download | 44-byte blocks, four attempts per block, 30 s total budget. |
 | `loader.ready` after the launcher | 30 s |
 | `control.hello` after the payload commit | 90 s (including the C# compile) |
 | Loader bootstrap deadline | 180 s |
@@ -157,17 +284,17 @@ The agent implements the full protocol v1 surface, not a reduced subset:
   transfer events, with the same limits as the Python agent (read 32 KiB
   default / 64 KiB maximum, write 64 KiB, list 200, search 200, find 500,
   transfer 512 MiB, window 1..64 with a default of 8);
-- `shell.job.start/cancel`, output events and results; each job is a child
-  powershell.exe assigned to a job object (cancellation and timeouts kill
-  the whole tree), but the command line carries no user script: it only
-  loads the compiled agent DLL and runs the in-process Runspace runner
-  (`JobEntry`), while the script itself travels over stdin and executes
-  in a custom `PSHost`. This keeps the script text out of every classic
-  PowerShell log channel (Id 400/800 `HostApplication`, 4103/4104 script
-  text, PSReadLine history) while keeping full PowerShell semantics:
-  stdout and stderr are captured separately, `exit 7` returns 7 and any
-  cmdlet error returns 1, exactly like the previous `-EncodedCommand`
-  child;
+- `shell.job.start/cancel`, output events and results; each job is the agent
+  executable itself started with `--job` and assigned to a job object
+  (cancellation and timeouts kill the whole tree). The command line carries
+  no user script: `--job` boots the in-process Runspace runner (`JobEntry`)
+  inside `agent.exe`, while the script itself travels over stdin and executes
+  in a custom `PSHost`. No powershell.exe child is spawned for a job, so no
+  classic PowerShell log channel records a job start; the script remains
+  subject to PowerShell engine logging and endpoint security policy inside
+  the Runspace. PowerShell semantics are preserved: stdout and stderr are
+  captured separately, `exit 7` returns 7 and any cmdlet error returns 1,
+  exactly like a `powershell.exe -Command` child;
 - `terminal.open/write/resize/close` over ConPTY (`CreatePseudoConsole`,
   `STARTUPINFOEX`, `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`,
   `CreateProcessW`, `ResizePseudoConsole`) with the system PowerShell 5.1 as
@@ -229,8 +356,12 @@ does not invent a remote error it could not receive.
 | `slave_layout_required` | No explicit `layout`; configuration is never a bootstrap fallback. | Yes, after verifying the focused window's input source. |
 | `slave_layout_unconfirmed` | `layout` passed without a real `layout_confirmed=true` for this attempt. | Yes, after a fresh verification. |
 | `invalid_argument` | `slave_cdc_port` is not `COM[1-9][0-9]*`, or the bootstrap arguments are invalid. | No, until corrected. |
-| `cdc_not_found` | No `Titella KVM` CDC was identified, or PnP identity is unavailable. Pass `slave_cdc_port`. | Yes, with a correct port. |
+| `cdc_not_found` | No present CDC with the project identity (`VID_17EF&PID_A38F`) was identified, or PnP identity is unavailable. Pass `slave_cdc_port`. | Yes, with a correct port. |
 | `cdc_ambiguous` | Several Titella CDC ports are present. Pass `slave_cdc_port`. | Yes, with a correct port. |
+| `slave_transport_unsupported` | `slave_transport=hid` was selected but the flashed firmware does not advertise the HID data protocol (older than 1.6.0), or the bundle carries no stage-0 microloader. | No fallback; reflash or switch the selection. |
+| `hid_loader_too_large` | The compressed loader exceeds the 32768-byte firmware snapshot. | No; shrink the loader. |
+| `hid_stage0_too_large` | The typed stage-0 line exceeds the 3072-character keystroke budget. | No; shrink the microloader. |
+| `agent_stop_timeout` | A stop was sent but `hid.health` never reported `slave_connected: false` for the selected destination within the wait. The old stream may still be attached. | Yes, once the state proves closed (or after checking the agent/console). |
 | `bootstrap_loader_timeout` | The loader did not announce `loader.ready`: launcher focus, a policy block before the port opens, or a port that cannot be opened. | Yes, after fixing the named cause. |
 | `cdc_disconnected` | The loader lost the CDC while reading frames (unplugged device or port reset) before the commit. | Yes, after checking the cable and the port. |
 | `size_mismatch` / `checksum_mismatch` | The received payload does not match size or SHA-256; the temporary is removed. | Yes, from scratch. |

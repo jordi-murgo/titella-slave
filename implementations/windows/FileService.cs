@@ -32,7 +32,9 @@ namespace Titella.Slave
         private static readonly DateTime Epoch =
             new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
 
-        /// <summary>Returns (result, payload); payload is non-null only for read.</summary>
+        private readonly ScreenService _screen = new ScreenService();
+
+        /// <summary>Returns (result, payload); payload is non-null only for read and screen.</summary>
         public sealed class Result
         {
             public IDictionary<string, object> Metadata;
@@ -160,6 +162,10 @@ namespace Titella.Slave
                 Result result = new Result();
                 result.Metadata = Sysinfo();
                 return result;
+            }
+            if (op == "screen")
+            {
+                return _screen.Capture();
             }
             throw new ProtocolError("unknown_op", "unknown fs operation", false);
         }
