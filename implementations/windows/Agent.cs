@@ -23,7 +23,8 @@ namespace Titella.Slave
         /// directory when one was supplied.
         /// </summary>
         public static int Run(string bootstrapDirectory, string linkId, string port,
-                              int heartbeatMilliseconds, int graceMilliseconds)
+                              int heartbeatMilliseconds, int graceMilliseconds,
+                              string implementation = AgentHost.ExeImplementation)
         {
             // Detach from the loader console: closing it must not stop the
             // agent, and the agent writes only to its own diagnostic file.
@@ -120,7 +121,8 @@ namespace Titella.Slave
                     },
                     bootstrapDirectory,
                     heartbeatMs,
-                    graceMs);
+                    graceMs,
+                    implementation);
                 agent.Run();
                 return 0;
             }
@@ -186,10 +188,12 @@ namespace Titella.Slave
             }
         }
         /// <summary>
-        /// Location of the compiled agent executable (agent.exe): job
-        /// children are this very image started with --job. When the agent
-        /// is hosted in a test process the location is that host, which is
-        /// still the image the job children run.
+        /// Location of the compiled agent assembly: agent.exe when the loader
+        /// compiled an executable, agent.dll when it compiled a library for a
+        /// PowerShell host. Job children are launched from this location
+        /// (see <see cref="JobManager"/>). When the agent is hosted in a test
+        /// process the location is that host, which is still the image the
+        /// job children run.
         /// </summary>
         internal static string ExecutableAssembly()
         {
@@ -206,6 +210,7 @@ namespace Titella.Slave
 
         private readonly string _linkId;
         private readonly string _bootstrapDirectory;
+        private readonly string _implementation;
         private readonly ManualResetEventSlim _stop = new ManualResetEventSlim(false);
         private readonly ManualResetEventSlim _cleanupDone = new ManualResetEventSlim(false);
         private readonly object _cleanupLock = new object();
@@ -230,10 +235,12 @@ namespace Titella.Slave
         private bool _capabilityChecked;
 
         public SlaveAgent(string linkId, ILinkTransport transport,
-                          string bootstrapDirectory, int heartbeatMs, int graceMs)
+                          string bootstrapDirectory, int heartbeatMs, int graceMs,
+                          string implementation = AgentHost.ExeImplementation)
         {
             _linkId = linkId;
             _bootstrapDirectory = bootstrapDirectory;
+            _implementation = implementation;
             _link = new AgentLink(
                 linkId,
                 delegate()
@@ -254,10 +261,12 @@ namespace Titella.Slave
         }
 
         public SlaveAgent(string linkId, Func<ILinkTransport> transportFactory,
-                          string bootstrapDirectory, int heartbeatMs, int graceMs)
+                          string bootstrapDirectory, int heartbeatMs, int graceMs,
+                          string implementation = AgentHost.ExeImplementation)
         {
             _linkId = linkId;
             _bootstrapDirectory = bootstrapDirectory;
+            _implementation = implementation;
             _link = new AgentLink(
                 linkId,
                 transportFactory,
@@ -290,7 +299,7 @@ namespace Titella.Slave
             body["python"] = null;
             body["pid"] = System.Diagnostics.Process.GetCurrentProcess().Id;
             body["uid"] = null;
-            body["implementation"] = "windows-dotnet";
+            body["implementation"] = _implementation;
             body["runtime"] = runtime;
             _link.SendFrame(Wire.BaseFrame(
                 _linkId, "control", "hello", "body", body));

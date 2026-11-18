@@ -44,14 +44,18 @@ namespace Titella.Slave.Tests
             Run("Transfer.SharedCorpus", TransferSharedCorpus);
 
             Run("Agent.HelloBindReady", AgentHelloBindReady);
+            Run("Agent.DllHelloBindReady", AgentDllHelloBindReady);
             Run("Agent.NotBoundBeforeBind", AgentNotBoundBeforeBind);
             Run("Agent.DuplicateDataIsReAckedOnce", AgentDuplicateData);
             Run("Agent.GapIsNotAcked", AgentGapIsNotAcked);
 
             Run("Job.StdoutStderrSeparated", JobStdoutStderrSeparated);
+            Run("Job.DllHostedSubprocess", JobDllHostedSubprocess);
+            Run("Job.LaunchShapePerFormat", JobLaunchShapePerFormat);
             Run("Job.ExitCodePropagates", JobExitCodePropagates);
             Run("Job.SlowReturnsId", JobSlowReturnsId);
             Run("Job.CancelKillsGrandchild", JobCancelKillsGrandchild);
+            Run("Job.DllCancelKillsGrandchild", JobDllCancelKillsGrandchild);
             Run("Job.TimeoutKillsGrandchild", JobTimeoutKillsGrandchild);
             Run("Job.SharedLimit", JobSharedLimit);
             Run("Job.ContainmentFailureIsHonest", JobContainmentFailure);
@@ -719,6 +723,46 @@ namespace Titella.Slave.Tests
             return body;
         }
 
+        /// <summary>
+        /// The hosted-DLL variant announces its own identity and binds exactly
+        /// like the exe one: the implementation is a selection, not a second
+        /// protocol.
+        /// </summary>
+        private static void AgentDllHelloBindReady()
+        {
+            using (PeerHarness harness = new PeerHarness())
+            {
+                string bootstrap = TempDirectory("titella-bootstrap-");
+                SlaveAgent agent = new SlaveAgent(
+                    LinkId(Fixture()), harness.Factory, bootstrap, 5000, 30000,
+                    "windows-dotnet-dll");
+                Thread thread = StartAgent(agent);
+                try
+                {
+                    MasterPeer peer = new MasterPeer(harness, LinkId(Fixture()));
+                    IDictionary<string, object> hello = peer.Next("hello", 8000);
+                    AssertEqual("control", Str(hello, "channel"), "hello channel");
+                    IDictionary<string, object> body = Obj(hello, "body");
+                    AssertEqual("windows-dotnet-dll", Str(body, "implementation"),
+                                "the hosted variant announces itself");
+                    AssertEqual(Process.GetCurrentProcess().Id, Num(body, "pid", -1), "real pid");
+                    IDictionary<string, object> runtime = Obj(body, "runtime");
+                    AssertEqual("dotnet-framework", Str(runtime, "name"), "runtime name");
+
+                    IDictionary<string, object> ready = peer.Request(
+                        "control", "bind", BindBody(LinkId(Fixture())), 8000);
+                    AssertEqual("ready", Str(ready, "status"), "ready status");
+                    AssertEqual(LinkId(Fixture()), Str(ready, "link_id"), "ready link");
+                    Assert(agent.Bound, "the agent reports itself bound");
+                }
+                finally
+                {
+                    StopAgent(agent, thread);
+                    DeleteTree(bootstrap);
+                }
+            }
+        }
+
         private static void AgentNotBoundBeforeBind()
         {
             using (PeerHarness harness = new PeerHarness())
@@ -951,6 +995,177 @@ namespace Titella.Slave.Tests
             return body;
         }
 
+        /// <summary>
+        /// The DLL variant's job child must behave like the exe one: the same
+        /// source compiled as a library, loaded from disk by Windows
+        /// PowerShell 5.1, reading the script from stdin and returning its
+        /// output and exit code. No agent.exe may be produced, and the
+        /// Assembly object must never leak into stdout (the [void] contract).
+        /// </summary>
+        private static void JobDllHostedSubprocess()
+        {
+            string work = TempDirectory("titella-dlljob-");
+            try
+            {
+                string[] units = SourceUnits();
+                StringBuilder source = new StringBuilder();
+                string directory = WindowsDirectory();
+                foreach (string name in units)
+                {
+                    string text = File.ReadAllText(Path.Combine(directory, name),
+                                                   new UTF8Encoding(false));
+                    if (source.Length > 0)
+                    {
+                        source.Append("\n\n");
+                    }
+                    source.Append(text.TrimEnd('\n'));
+                }
+                source.Append('\n');
+                string payload = Path.Combine(work, "payload.cs");
+                File.WriteAllText(payload, source.ToString(), new UTF8Encoding(false));
+
+                string framework = FrameworkDirectory();
+                string dll = Path.Combine(work, "agent.dll");
+                StringBuilder command = new StringBuilder();
+                command.Append("/nologo /target:library /out:\"").Append(dll).Append('"');
+                foreach (string reference in new string[]
+                         {
+                             "System.dll", "System.Core.dll", "System.Web.Extensions.dll",
+                             "System.Drawing.dll",
+                         })
+                {
+                    command.Append(" /r:\"").Append(Path.Combine(framework, reference)).Append('"');
+                }
+                string automation = AutomationAssembly();
+                if (automation != null)
+                {
+                    command.Append(" /r:\"").Append(automation).Append('"');
+                }
+                command.Append(" \"").Append(payload).Append('"');
+                Process compile = new Process();
+                compile.StartInfo.FileName = Path.Combine(framework, "csc.exe");
+                compile.StartInfo.Arguments = command.ToString();
+                compile.StartInfo.UseShellExecute = false;
+                compile.StartInfo.CreateNoWindow = true;
+                compile.StartInfo.RedirectStandardError = true;
+                compile.StartInfo.RedirectStandardOutput = true;
+                compile.Start();
+                string compileError = compile.StandardError.ReadToEnd();
+                compile.StandardOutput.ReadToEnd();
+                Assert(compile.WaitForExit(120000), "csc finished");
+                AssertEqual(0, compile.ExitCode, "csc /target:library failed: " + compileError);
+                Assert(File.Exists(dll), "agent.dll was produced");
+                Assert(!File.Exists(Path.Combine(work, "agent.exe")),
+                       "the DLL build never produces an executable");
+
+                string script =
+                    "[void][Reflection.Assembly]::LoadFrom('"
+                    + dll.Replace("'", "''")
+                    + "'); exit ([Titella.Slave.AgentHost]::Main([string[]]@('--job')))";
+                Process child = new Process();
+                child.StartInfo.FileName = "powershell.exe";
+                child.StartInfo.Arguments =
+                    "-NoLogo -NoProfile -NonInteractive -Command \"" + script + "\"";
+                child.StartInfo.UseShellExecute = false;
+                child.StartInfo.CreateNoWindow = true;
+                child.StartInfo.WorkingDirectory = work;
+                child.StartInfo.RedirectStandardInput = true;
+                child.StartInfo.RedirectStandardOutput = true;
+                child.StartInfo.RedirectStandardError = true;
+                child.Start();
+                child.StandardInput.Write("Write-Output 'DLL_OK'; exit 7");
+                child.StandardInput.Close();
+                string stdout = child.StandardOutput.ReadToEnd();
+                string stderr = child.StandardError.ReadToEnd();
+                Assert(child.WaitForExit(60000), "the hosted job finished");
+                AssertEqual(7, child.ExitCode, "exit code propagates through the host");
+                AssertEqual("DLL_OK", stdout.Trim(), "only the script output reaches stdout");
+                AssertEqual("", stderr.Trim(), "no banner or loader error on stderr");
+                Assert(stdout.IndexOf("Assembly", StringComparison.Ordinal) < 0,
+                       "the loaded Assembly object never reaches stdout");
+                Assert(!File.Exists(Path.Combine(work, "agent.exe")),
+                       "no agent.exe appears beside the library");
+            }
+            finally
+            {
+                DeleteTree(work);
+            }
+        }
+
+        /// <summary>
+        /// The command line carries the path and the --job selector only: the
+        /// script never appears there, and a library is always launched
+        /// through a PowerShell host that loads it by path with [void], so the
+        /// Assembly object cannot reach the job's stdout.
+        /// </summary>
+        private static void JobLaunchShapePerFormat()
+        {
+            string exePath = Path.Combine(@"C:\Temp\rig", "agent.exe");
+            string image;
+            StringBuilder line;
+            JobManager.LaunchCommand(exePath, out image, out line);
+            AssertEqual(exePath, image, "the exe image is started directly");
+            AssertEqual("\"" + exePath + "\" --job", line.ToString(),
+                        "the exe child takes only --job");
+
+            string dllPath = Path.Combine(@"C:\Temp\rig", "agent.dll");
+            JobManager.LaunchCommand(dllPath, out image, out line);
+            string rendered = line.ToString();
+            Assert(image.EndsWith("powershell.exe", StringComparison.OrdinalIgnoreCase),
+                   "the library is launched by a PowerShell host, got " + image);
+            Assert(rendered.IndexOf("-NoLogo -NoProfile -NonInteractive -Command",
+                                    StringComparison.Ordinal) > 0,
+                   "the host runs one non-interactive command");
+            Assert(rendered.IndexOf("[void][Reflection.Assembly]::LoadFrom('"
+                                    + dllPath + "')", StringComparison.Ordinal) > 0,
+                   "the assembly is loaded by path with [void]");
+            Assert(rendered.IndexOf("AgentHost]::Main([string[]]@('--job'))",
+                                    StringComparison.Ordinal) > 0,
+                   "the child calls the shared entry point with --job");
+            Assert(rendered.IndexOf("--job\"", StringComparison.Ordinal) < 0,
+                   "the library is not passed to an image as an argument");
+
+            // A path containing an apostrophe must stay one PowerShell literal:
+            // the quote is doubled, never left to terminate the string early.
+            string quoted = Path.Combine(@"C:\Temp\o'brien", "agent.dll");
+            JobManager.LaunchCommand(quoted, out image, out line);
+            string escaped = line.ToString();
+            Assert(escaped.IndexOf("LoadFrom('" + quoted.Replace("'", "''") + "')",
+                                   StringComparison.Ordinal) > 0,
+                   "an apostrophe in the path is escaped for PowerShell, got " + escaped);
+            Assert(escaped.IndexOf("LoadFrom('" + quoted + "')", StringComparison.Ordinal) < 0,
+                   "the raw apostrophe never closes the literal");
+        }
+
+        private static string FrameworkDirectory()
+        {
+            string framework = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+                "Microsoft.NET", "Framework64", "v4.0.30319");
+            if (!Directory.Exists(framework))
+            {
+                framework = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+                    "Microsoft.NET", "Framework", "v4.0.30319");
+            }
+            Assert(Directory.Exists(framework), "the .NET Framework compiler exists");
+            return framework;
+        }
+
+        private static string AutomationAssembly()
+        {
+            string gac = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+                "Microsoft.NET", "assembly", "GAC_MSIL", "System.Management.Automation");
+            if (!Directory.Exists(gac))
+            {
+                return null;
+            }
+            string[] found = Directory.GetFiles(
+                gac, "System.Management.Automation.dll", SearchOption.AllDirectories);
+            return found.Length == 0 ? null : found[0];
+        }
+
         private static void JobExitCodePropagates()
         {
             using (PeerHarness harness = new PeerHarness())
@@ -1047,6 +1262,49 @@ namespace Titella.Slave.Tests
             IDictionary<string, object> body = new Dictionary<string, object>();
             body["job_id"] = jobId;
             return body;
+        }
+
+        /// <summary>
+        /// The hosted variant keeps the exe's containment guarantee: cancelling
+        /// the job kills the whole tree, including a grandchild started by the
+        /// user script. The agent runs with the DLL identity, so the child is
+        /// the PowerShell host loading the assembly rather than agent.exe.
+        /// </summary>
+        private static void JobDllCancelKillsGrandchild()
+        {
+            using (PeerHarness harness = new PeerHarness())
+            {
+                string bootstrap = TempDirectory("titella-bootstrap-");
+                string work = TempDirectory("titella-dllcancel-");
+                SlaveAgent agent = new SlaveAgent(
+                    LinkId(Fixture()), harness.Factory, bootstrap, 5000, 30000,
+                    "windows-dotnet-dll");
+                Thread thread = StartAgent(agent);
+                try
+                {
+                    MasterPeer peer = Bind(harness);
+                    string file = Path.Combine(work, "ping.txt");
+                    string command = "& cmd.exe /c 'ping -n 30 127.0.0.1 > \"" + file + "\"'";
+                    peer.Request("shell", "job.start", JobBody("dllcancel", command, 60), 8000);
+                    WaitUntilFile(work, 15000);
+                    long before = LengthOf(work);
+                    IDictionary<string, object> cancelled = peer.Request(
+                        "shell", "job.cancel", CancelBody("dllcancel"), 8000);
+                    AssertEqual("cancelled", Str(cancelled, "status"), "cancel status");
+                    IDictionary<string, object> finished = peer.WaitEvent(
+                        "job.finished", "dllcancel", 15000);
+                    AssertEqual(true, Obj(finished, "body")["cancelled"], "cancelled flag");
+                    long after = LengthOf(work);
+                    Thread.Sleep(1000);
+                    AssertEqual(after, LengthOf(work), "the grandchild stopped writing");
+                }
+                finally
+                {
+                    StopAgent(agent, thread);
+                    DeleteTree(bootstrap);
+                    DeleteTree(work);
+                }
+            }
         }
 
         private static void JobTimeoutKillsGrandchild()

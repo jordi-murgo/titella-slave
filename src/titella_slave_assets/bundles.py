@@ -20,9 +20,17 @@ from titella_slave_assets.wire import PROTOCOL_VERSION as _WIRE_PROTOCOL_VERSION
 # Manifest contract; must stay in lockstep with build_support.py. The
 # protocol version is not re-declared here: it comes from the canonical wire
 # codec, so the bundle API can never disagree with the frames it validates.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 PROTOCOL_VERSION = _WIRE_PROTOCOL_VERSION
-IMPLEMENTATIONS = ("python", "windows-dotnet")
+# `windows-dotnet` and `windows-dotnet-dll` are the same C# source and the
+# same loader template: only the compilation mode differs (exe vs library
+# hosted by Windows PowerShell 5.1). They are distinct names so a selection
+# stays explicit and `auto` keeps pointing at the exe.
+IMPLEMENTATIONS = (
+    "python", "windows-dotnet", "windows-dotnet-dll", "windows-python")
+# Implementations that ship a USB-only HID bootstrap (stage-0 + transport unit)
+# instead of a CDC/clipboard loader only.
+HID_IMPLEMENTATIONS = ("windows-dotnet", "windows-dotnet-dll", "windows-python")
 MAX_MANIFEST_BYTES = 64 * 1024
 MAX_LOADER_BYTES = 512 * 1024
 # The Windows HID bootstrap artifacts are bounded before they reach the
@@ -253,7 +261,7 @@ def _load_from(data_dir: Any, implementation: str) -> SlaveBundle:
         raise BundleError(_CODE_INVALID, f"{loader_name} is not valid UTF-8: {exc}") from exc
     hid_stage0_source: str | None = None
     hid_transport_source: str | None = None
-    if implementation == "windows-dotnet":
+    if implementation in HID_IMPLEMENTATIONS:
         bootstrap = _validate_hid_bootstrap(implementation, entry)
         hid_stage0_source = _read_hid_artifact(
             data_dir, bootstrap["stage0"], bootstrap["stage0_sha256"],
@@ -264,7 +272,7 @@ def _load_from(data_dir: Any, implementation: str) -> SlaveBundle:
             "the HID transport unit",
         )
     elif "hid_bootstrap" in entry:
-        # Schema 2 defines exactly one HID bootstrap: the Windows one. A
+        # Only the Windows implementations carry a HID bootstrap. A POSIX
         # Python entry carrying the block is a malformed manifest, and
         # ignoring it would hide a packaging error.
         raise BundleError(

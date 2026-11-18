@@ -1,0 +1,77 @@
+import base64,hashlib,json,os,shutil,subprocess,sys,tempfile,time
+L=globals().get("L","__LINK_ID__");S="__SESSION_ID__";P=__CDC_PORT__;partial=root=out=rid=rop=hs=None;expected=0;meta=None
+def send(ch,typ,**kw):
+ d={"v":1,"channel":ch,"type":typ,"link_id":L};d.update(kw);hs.write((json.dumps(d,separators=(",",":"))+"\n").encode())
+def hframe(f):
+ global rid,rop,meta,partial,out,expected,hs
+ typ=f.get("type");frid=f.get("request_id");fop=f.get("op");body=f.get("body") or {}
+ if typ=="request" and fop=="begin":
+  rid=frid;rop=fop;meta=body;partial=os.path.join(root,".payload.pyz.part");out=open(partial,"wb");expected=0
+  send("bootstrap","response",request_id=frid,op=fop,body={"status":"ready","session_id":S});rid=rop=None
+ elif typ=="data" and f.get("session_id")==S and out is not None:
+  seq=int(f.get("seq",-1))
+  if seq==expected: out.write(base64.b64decode(f["data_b64"],validate=True));expected+=1;print(".",end="",flush=True)
+  if seq<=expected: send("bootstrap","ack",session_id=S,ack_seq=seq)
+ elif typ=="request" and fop=="commit" and out is not None:
+  rid=frid;rop=fop;out.close();out=None;data=open(partial,"rb").read()
+  if len(data)!=int(meta["size"]): raise RuntimeError("size_mismatch")
+  if hashlib.sha256(data).hexdigest()!=meta["sha256"]: raise RuntimeError("checksum_mismatch")
+  final=os.path.join(root,".payload.pyz");os.replace(partial,final)
+  # The commit answer must be on the wire before the stream goes away: Write
+  # returns once the peer acknowledged the bytes, so closing afterwards cannot
+  # drop it.
+  send("bootstrap","response",request_id=frid,op=fop,body={"status":"started","size":len(data),"sha256":meta["sha256"]})
+  hs.close();hs=None
+  # The agent opens the same collection, so the mutex must be free by now. It
+  # carries the transport inside its own zipapp, so the staging directory this
+  # loader was started from is dead weight from here on.
+  env=dict(os.environ);env["PATH"]=os.pathsep.join([os.path.dirname(sys.executable),env.get("PATH","")])
+  subprocess.Popen([sys.executable,final,"--port",binding,"--link-id",L,"--bootstrap-dir",root],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,close_fds=True,env=env,creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
+  stage=os.environ.get("TITELLA_STAGE_DIR")
+  if stage: shutil.rmtree(stage,ignore_errors=True)
+  print(" OK",flush=True)
+  time.sleep(.5);sys.exit(0)
+print("Loading agent ",end="",flush=True)
+try:
+ if sys.version_info<(3,9): raise RuntimeError("python_unavailable")
+ binding=str(P or "").strip().upper()
+ if not (binding.startswith("HID:") and len(binding)==16): raise RuntimeError("hid_binding_required")
+ sys.path.insert(0,os.environ.get("TITELLA_STAGE_DIR") or os.path.dirname(os.path.abspath(__file__)))
+ import hid_transport
+ root=tempfile.mkdtemp(prefix="titella-bootstrap-")
+ hs=hid_transport.open_stream(binding)
+ send("bootstrap","event",session_id=S,op="loader.ready",body={"python":sys.version.split()[0]})
+ buf=b"";overflow=False;deadline=time.monotonic()+180
+ while time.monotonic()<deadline and hs is not None:
+  chunk=hs.read(4096)
+  if not chunk: continue
+  buf+=chunk
+  while True:
+   nl=buf.find(b"\n")
+   if nl<0:
+    if len(buf)>4097: overflow=True;buf=b""
+    break
+   line=buf[:nl];buf=buf[nl+1:]
+   if overflow: overflow=False;continue
+   if not line or len(line)>4096: continue
+   try: f=json.loads(line)
+   except Exception: continue
+   if f.get("v")!=1 or f.get("link_id")!=L or f.get("channel")!="bootstrap": continue
+   hframe(f)
+ raise RuntimeError("bootstrap_timeout")
+except Exception as e:
+ code=str(e) or "loader_failed"
+ print(" ERROR: "+code,flush=True)
+ try:
+  if hs is not None:
+   if rid is not None: send("bootstrap","error",request_id=rid,op=rop,body={"code":code,"message":code,"retryable":False})
+   else: send("bootstrap","error",session_id=S,body={"code":code,"message":code,"retryable":False})
+   hs.close()
+ except Exception: sys.stderr.write(code+"\n");sys.stderr.flush()
+ try:
+  if out: out.close()
+ except Exception: pass
+ if root: shutil.rmtree(root,ignore_errors=True)
+ # Leave the staging directory alone: it is deleted by the stage-0 parent's
+ # own cleanup rule, and a failed run is diagnosed from its files.
+ sys.exit(1)

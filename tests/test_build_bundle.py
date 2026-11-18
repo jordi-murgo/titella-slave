@@ -17,6 +17,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -59,22 +60,52 @@ def _hid_bootstrap(stage0: bytes = HID_STAGE0,
     }
 
 
+WINDOWS_PYTHON_PAYLOAD = b"# windows python zipapp"
+WINDOWS_PYTHON_STAGE0 = b"# python hid stage0\n__HID_TOKEN__ __HID_SIZE__ __HID_SHA256__\n"
+WINDOWS_PYTHON_TRANSPORT = b"# python hid transport unit\n"
+
+
+def _windows_python_entry(payload: bytes = WINDOWS_PYTHON_PAYLOAD,
+                          loader: bytes = b"# python loader\n",
+                          stage0: bytes = WINDOWS_PYTHON_STAGE0,
+                          transport: bytes = WINDOWS_PYTHON_TRANSPORT
+                          ) -> dict[str, object]:
+    entry = _entry(build_support.WINDOWS_PYTHON_PAYLOAD_NAME,
+                   build_support.WINDOWS_PYTHON_LOADER_NAME, payload, loader)
+    entry["hid_bootstrap"] = {
+        "stage0": build_support.WINDOWS_PYTHON_STAGE0_NAME,
+        "stage0_sha256": hashlib.sha256(stage0).hexdigest(),
+        "transport": build_support.WINDOWS_PYTHON_HID_TRANSPORT_NAME,
+        "transport_sha256": hashlib.sha256(transport).hexdigest(),
+    }
+    return entry
+
+
 def _manifest_for(python_payload: bytes, windows_payload: bytes,
                   loader: bytes = b"# loader\n",
                   windows_loader: bytes = b"# windows loader\n",
                   hid_stage0: bytes = HID_STAGE0,
-                  hid_transport: bytes = HID_TRANSPORT) -> dict[str, object]:
+                  hid_transport: bytes = HID_TRANSPORT,
+                  windows_python: dict[str, object] | None = None
+                  ) -> dict[str, object]:
     windows = _entry("titella-slave.cs", "windows.ps1.tmpl",
                      windows_payload, windows_loader)
     windows["hid_bootstrap"] = _hid_bootstrap(hid_stage0, hid_transport)
+    # The DLL variant reuses the exe variant's artifacts: same source, same
+    # template, same HID bootstrap; only the rendered compile mode differs.
+    windows_dll = _entry("titella-slave.cs", "windows.ps1.tmpl",
+                         windows_payload, windows_loader)
+    windows_dll["hid_bootstrap"] = _hid_bootstrap(hid_stage0, hid_transport)
     return {
-        "schema_version": 2,
+        "schema_version": build_support.SCHEMA_VERSION,
         "protocol": 1,
         "version": __version__,
         "implementations": {
             "python": _entry("titella-slave.pyz", "python.py.tmpl",
                              python_payload, loader),
             "windows-dotnet": windows,
+            "windows-dotnet-dll": windows_dll,
+            "windows-python": windows_python or _windows_python_entry(),
         },
     }
 
@@ -102,6 +133,20 @@ def _data_dir_with(case: unittest.TestCase, manifest: dict[str, object],
         (directory / windows["loader"]).write_bytes(b"# windows loader\n")
         (directory / build_support.WINDOWS_HID_STAGE0_NAME).write_bytes(hid_stage0)
         (directory / build_support.WINDOWS_HID_TRANSPORT_NAME).write_bytes(hid_transport)
+    if "windows-dotnet-dll" in manifest["implementations"]:
+        dll = manifest["implementations"]["windows-dotnet-dll"]
+        (directory / dll["payload"]).write_bytes(windows_payload)
+        (directory / dll["loader"]).write_bytes(b"# windows loader\n")
+        (directory / build_support.WINDOWS_HID_STAGE0_NAME).write_bytes(hid_stage0)
+        (directory / build_support.WINDOWS_HID_TRANSPORT_NAME).write_bytes(hid_transport)
+    if "windows-python" in manifest["implementations"]:
+        wp = manifest["implementations"]["windows-python"]
+        (directory / wp["payload"]).write_bytes(WINDOWS_PYTHON_PAYLOAD)
+        (directory / wp["loader"]).write_bytes(b"# python loader\n")
+        (directory / build_support.WINDOWS_PYTHON_STAGE0_NAME).write_bytes(
+            WINDOWS_PYTHON_STAGE0)
+        (directory / build_support.WINDOWS_PYTHON_HID_TRANSPORT_NAME).write_bytes(
+            WINDOWS_PYTHON_TRANSPORT)
     (directory / "manifest.json").write_text(
         json.dumps(manifest), encoding="utf-8"
     )
@@ -197,6 +242,22 @@ class BuildDeterminismTests(unittest.TestCase):
         self.assertLess(order.index("AgentHost.cs"), order.index("CdcTransport.cs"))
         self.assertIn(b"public static int Main(string[] args)", data)
 
+    def test_payloads_carry_only_their_platform_modules(self) -> None:
+        """A payload must not ship modules its platform cannot import."""
+        posix = {name for name, _ in build_support.python_sources(ROOT, "posix")}
+        windows = {name for name, _ in build_support.python_sources(ROOT, "windows")}
+        self.assertIn("shell_service.py", posix)
+        self.assertIn("screen_service.py", posix)
+        for name in build_support.WINDOWS_ONLY_MODULES:
+            self.assertNotIn(name, posix, "%s must not reach the POSIX payload" % name)
+        for name in ("hid_transport.py", "shell_service_win.py", "screen_service_win.py"):
+            self.assertIn(name, windows)
+        for name in build_support.POSIX_ONLY_MODULES:
+            self.assertNotIn(name, windows, "%s must not reach the Windows payload" % name)
+        # Everything else is shared byte for byte.
+        shared = posix - build_support.POSIX_ONLY_MODULES
+        self.assertEqual(shared, windows - build_support.WINDOWS_ONLY_MODULES)
+
     def test_missing_windows_sources_are_reported_honestly(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             with self.assertRaises(build_support.TitellaBuildError) as raised:
@@ -232,16 +293,45 @@ class BuildDeterminismTests(unittest.TestCase):
             self.assertIn(placeholder, text)
         for forbidden in ("ExecutionPolicy Bypass", "Unblock-File", "-WindowStyle Hidden"):
             self.assertNotIn(forbidden, text)
-        # The payload is compiled to agent.exe with the framework's own csc
-        # and started directly: no powershell.exe child, no Add-Type payload
-        # compile, no -EncodedCommand, never invoked as a .ps1 file with -File.
+        # The payload is compiled with the framework's own csc: to agent.exe
+        # with a direct start, or to agent.dll hosted by a separate Windows
+        # PowerShell 5.1 process. No Add-Type payload compile, no
+        # -EncodedCommand, never invoked as a .ps1 file with -File.
         self.assertIn("csc.exe", text)
+        self.assertIn("__AGENT_FORMAT__", text)
         self.assertIn("/target:exe", text)
+        self.assertIn("/target:library", text)
         self.assertIn("/main:Titella.Slave.AgentHost", text)
         self.assertIn("agent.json", text)
+        self.assertIn("agent-load.err.log", text)
+        self.assertIn("payload_start_failed", text)
         self.assertNotIn("-EncodedCommand", text)
+        self.assertNotIn("-ExecutionPolicy", text)
         self.assertNotIn("-File ", text)
         self.assertIn("FreeConsole", build_support.build_windows_source(ROOT).decode("utf-8"))
+
+    def test_loader_start_agent_avoids_automatic_variables(self) -> None:
+        """`$Host` (and friends) are automatic: assigning one aborts the run.
+
+        The first live hp-bs DLL attempt died with "Cannot overwrite variable
+        Host because it is read-only or constant" — the loader had reused
+        `$host` for the agent host path. The parse-only check cannot see this,
+        so the branch is extracted and executed with every assignment probed.
+        """
+        text = build_support.loader_bytes(
+            ROOT, build_support.WINDOWS_LOADER_NAME).decode("utf-8")
+        start = text.index("function Start-Agent")
+        branch = text[start:text.index("\nfunction Parse-Buffer", start)]
+        dll_part = branch[branch.index("if (-not $dll) {"):]
+        for reserved in ("$host", "$PID", "$input", "$args", "$false", "$true",
+                         "$null", "$error", "$pwd", "$home", "$pshome"):
+            pattern = re.compile(r"(?<![\w$])" + re.escape(reserved) + r"\s*=(?!=)",
+                                 re.IGNORECASE)
+            self.assertIsNone(
+                pattern.search(dll_part),
+                f"the DLL branch assigns the automatic variable {reserved}")
+        self.assertIn("$agentHost", dll_part)
+        self.assertIn("PSHOME", dll_part)
 
     def test_manifest_hashes_and_sizes_come_from_built_bytes(self) -> None:
         """Every manifest value must derive from the built bytes."""
@@ -251,11 +341,13 @@ class BuildDeterminismTests(unittest.TestCase):
             manifest = json.loads(
                 (data_dir / "manifest.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(manifest["schema_version"], 2)
+            self.assertEqual(manifest["schema_version"],
+                             build_support.SCHEMA_VERSION)
             self.assertEqual(manifest["protocol"], 1)
             self.assertEqual(manifest["version"], __version__)
             self.assertEqual(
-                set(manifest["implementations"]), {"python", "windows-dotnet"}
+                set(manifest["implementations"]),
+                {"python", "windows-dotnet", "windows-dotnet-dll", "windows-python"}
             )
             for entry in manifest["implementations"].values():
                 payload = (data_dir / entry["payload"]).read_bytes()
@@ -282,6 +374,22 @@ class BuildDeterminismTests(unittest.TestCase):
                 bootstrap["transport_sha256"], hashlib.sha256(transport).hexdigest()
             )
             self.assertNotIn("hid_bootstrap", manifest["implementations"]["python"])
+            # The DLL variant must not duplicate any byte: both Windows
+            # entries name the same artifacts and therefore carry the same
+            # hashes, and the packaged file set contains exactly one copy.
+            exe_entry = manifest["implementations"]["windows-dotnet"]
+            dll_entry = manifest["implementations"]["windows-dotnet-dll"]
+            self.assertEqual(exe_entry["payload"], dll_entry["payload"])
+            self.assertEqual(exe_entry["loader"], dll_entry["loader"])
+            self.assertEqual(exe_entry["sha256"], dll_entry["sha256"])
+            self.assertEqual(exe_entry["loader_sha256"], dll_entry["loader_sha256"])
+            self.assertEqual(exe_entry["hid_bootstrap"], dll_entry["hid_bootstrap"])
+            packaged = set()
+            for entry in manifest["implementations"].values():
+                packaged.add(entry["payload"])
+                packaged.add(entry["loader"])
+            files = {path.name for path in data_dir.iterdir() if path.is_file()}
+            self.assertTrue(packaged <= files, "every named artifact exists")
             first = (data_dir / "manifest.json").read_bytes()
             build_support.write_bundle_assets(ROOT, data_dir)
             self.assertEqual(first, (data_dir / "manifest.json").read_bytes())
@@ -503,6 +611,39 @@ class BundleValidationTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, bundles.BUNDLE_INCOMPATIBLE)
 
 
+    def test_dll_variant_loads_from_the_same_artifacts(self) -> None:
+        """`windows-dotnet-dll` validates and returns byte-identical sources.
+
+        The two names exist only so the loader render can choose the compile
+        mode; the bundle API must never hand the master a second copy.
+        """
+        payload = b"payload-bytes"
+        manifest = _manifest_for(payload, b"// cs")
+        data_dir = _data_dir_with(self, manifest, payload)
+        exe = bundles._load_from(data_dir, "windows-dotnet")
+        dll = bundles._load_from(data_dir, "windows-dotnet-dll")
+        self.assertEqual(dll.implementation, "windows-dotnet-dll")
+        self.assertEqual(dll.payload, exe.payload)
+        self.assertEqual(dll.sha256, exe.sha256)
+        self.assertEqual(dll.loader_source, exe.loader_source)
+        self.assertEqual(dll.hid_stage0_source, exe.hid_stage0_source)
+        self.assertEqual(dll.hid_transport_source, exe.hid_transport_source)
+
+    def test_dll_variant_is_a_declared_hid_implementation(self) -> None:
+        self.assertIn("windows-dotnet-dll", bundles.IMPLEMENTATIONS)
+        self.assertIn("windows-dotnet-dll", bundles.HID_IMPLEMENTATIONS)
+
+    def test_dll_variant_without_hid_bootstrap_is_invalid(self) -> None:
+        """Same contract as the exe entry: a Windows variant carries HID."""
+        payload = b"payload-bytes"
+        manifest = _manifest_for(payload, b"// cs")
+        del manifest["implementations"]["windows-dotnet-dll"]["hid_bootstrap"]
+        data_dir = _data_dir_with(self, manifest, payload)
+        with self.assertRaises(bundles.BundleError) as raised:
+            bundles._load_from(data_dir, "windows-dotnet-dll")
+        self.assertEqual(raised.exception.code, bundles.BUNDLE_INVALID)
+
+
 class HidBootstrapValidationTests(unittest.TestCase):
     """Schema 2: the Windows bundle must carry both validated HID artifacts."""
 
@@ -669,7 +810,8 @@ class DocumentationPackagingTests(unittest.TestCase):
             # Documentation is not a bundle payload: the pinned manifest keeps
             # exactly the two implementations.
             self.assertEqual(
-                set(manifest["implementations"]), {"python", "windows-dotnet"}
+                set(manifest["implementations"]),
+                {"python", "windows-dotnet", "windows-dotnet-dll", "windows-python"}
             )
             docs_dir = data_dir / "docs"
             packaged = sorted(path.name for path in docs_dir.iterdir())

@@ -26,18 +26,29 @@ except ImportError:  # pragma: no cover - only hit without setuptools installed
 _FIXED_TIME = (2020, 1, 1, 0, 0, 0)
 _SHEBANG = b"#!/usr/bin/env python3\n"
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 # Must match [project].version in pyproject.toml and
 # titella_slave_assets.__version__; the loader rejects any other value.
-ASSETS_VERSION = "1.1.0"
+ASSETS_VERSION = "1.3.0"
 
 PYTHON_PAYLOAD_NAME = "titella-slave.pyz"
 WINDOWS_PAYLOAD_NAME = "titella-slave.cs"
+# The Windows agent that needs Python on the target. Same zipapp builder as
+# the POSIX payload, different platform modules (HID transport, ConPTY shell,
+# GDI capture) collected from their own directory.
+WINDOWS_PYTHON_PAYLOAD_NAME = "titella-slave-windows.pyz"
 PYTHON_LOADER_NAME = "python.py.tmpl"
 WINDOWS_LOADER_NAME = "windows.ps1.tmpl"
+WINDOWS_PYTHON_STAGE0_NAME = "windows-python-hid-stage0.ps1.tmpl"
+WINDOWS_PYTHON_LOADER_NAME = "windows-python-hid.py.tmpl"
 WINDOWS_HID_STAGE0_NAME = "windows-hid-stage0.ps1.tmpl"
 WINDOWS_HID_TRANSPORT_NAME = "windows-hid-transport.cs"
 WINDOWS_HID_TRANSPORT_SOURCE = "HidByteStream.cs"
+# One transport unit per runtime: the C# source above and this stdlib Python
+# module. Both implement the same 0x10 flow and are packaged verbatim, so the
+# master never receives a second copy that can drift from the compiled agent.
+WINDOWS_PYTHON_HID_TRANSPORT_NAME = "windows-python-hid-transport.py"
+WINDOWS_PYTHON_HID_TRANSPORT_SOURCE = "hid_transport.py"
 MANIFEST_NAME = "manifest.json"
 
 # Upper bound shared with the master's bundle reader: the HID bootstrap
@@ -51,6 +62,7 @@ DOCS_SOURCE_DIR = "docs"
 DOCUMENTATION_NAMES = (
     "bootstrap-python.md",
     "bootstrap-windows.md",
+    "bootstrap-windows-python.md",
     "serial-protocol.md",
 )
 # Upper bound shared with the master's documentation reader: a document above
@@ -105,8 +117,25 @@ def _declared_version(source: Path) -> str:
     return value
 
 
-def python_sources(root: Path) -> list[tuple[str, bytes]]:
-    """Flat modules of the zipapp: canonical wire.py plus the agent modules."""
+# Modules that only a POSIX host can import: `pty`, `fcntl`, `termios` and
+# `pwd` do not exist on Windows, so a Windows payload must not carry them and
+# the platform selection in `__main__`/`file_service` never reaches them.
+POSIX_ONLY_MODULES = frozenset(("shell_service.py", "screen_service.py"))
+# Windows-only modules: the POSIX payload must not carry a ctypes device layer
+# or a ConPTY manager that nothing on that platform can import.
+WINDOWS_ONLY_MODULES = frozenset((
+    "hid_transport.py", "shell_service_win.py", "screen_service_win.py"))
+
+
+def python_sources(root: Path, runtime: str = "posix") -> list[tuple[str, bytes]]:
+    """Flat modules of the zipapp: canonical wire.py plus the agent modules.
+
+    ``runtime`` selects the platform set: ``posix`` carries the POSIX shell and
+    screen services, ``windows`` carries the Windows ones and the HID
+    transport instead. Everything else is shared byte for byte.
+    """
+    if runtime not in ("posix", "windows"):
+        raise TitellaBuildError("python_payload_missing", f"unknown runtime {runtime!r}")
     root = Path(root)
     wire = root / "src" / "titella_slave_assets" / "wire.py"
     if not wire.is_file():
@@ -118,22 +147,36 @@ def python_sources(root: Path) -> list[tuple[str, bytes]]:
     for path in sorted(agent.glob("*.py"), key=lambda item: item.name):
         if path.name == "__init__.py":
             continue
+        if runtime == "posix" and path.name in WINDOWS_ONLY_MODULES:
+            # The POSIX agent has no HID transport and no Windows services;
+            # carrying them would ship code nothing on that platform can reach.
+            continue
+        if runtime == "windows" and path.name in POSIX_ONLY_MODULES:
+            continue
         files.append((path.name, path.read_bytes()))
     if not any(name == "__main__.py" for name, _ in files):
         raise TitellaBuildError(
             "python_payload_missing", "implementations/python/__main__.py is missing"
         )
+    if runtime == "windows":
+        for required in ("hid_transport.py", "shell_service_win.py",
+                         "screen_service_win.py"):
+            if not any(name == required for name, _ in files):
+                raise TitellaBuildError(
+                    "python_payload_missing",
+                    f"implementations/python/{required} is missing",
+                )
     return files
 
 
-def build_zipapp_bytes(root: Path) -> bytes:
+def build_zipapp_bytes(root: Path, runtime: str = "posix") -> bytes:
     """Deterministic zipapp: fixed timestamps, entry order, permissions."""
     buffer = io.BytesIO()
     buffer.write(_SHEBANG)
     with zipfile.ZipFile(
         buffer, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
     ) as archive:
-        for name, data in python_sources(root):
+        for name, data in python_sources(root, runtime):
             info = zipfile.ZipInfo(name, _FIXED_TIME)
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o644 << 16
@@ -187,6 +230,36 @@ def loader_bytes(root: Path, filename: str) -> bytes:
     return path.read_bytes()
 
 
+def windows_python_transport_source(root: Path) -> bytes:
+    """The stdlib Python HID transport unit, packaged verbatim.
+
+    Sibling of ``hid_transport_source``: one implementation of the 0x10 report
+    protocol per runtime. The packaged ``windows-python-hid-transport.py`` is a
+    byte copy of ``implementations/python/hid_transport.py``, so the master
+    never stages a second copy that can drift from the payload it starts.
+    """
+    path = Path(root) / "implementations" / "python" / WINDOWS_PYTHON_HID_TRANSPORT_SOURCE
+    if not path.is_file():
+        raise TitellaBuildError(
+            "hid_transport_missing",
+            f"implementations/python/{WINDOWS_PYTHON_HID_TRANSPORT_SOURCE} is missing",
+        )
+    data = path.read_bytes()
+    if data.startswith(b"\xef\xbb\xbf"):
+        raise TitellaBuildError(
+            "hid_transport_invalid",
+            f"{WINDOWS_PYTHON_HID_TRANSPORT_SOURCE} must be UTF-8 without BOM",
+        )
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise TitellaBuildError(
+            "hid_transport_invalid",
+            f"{WINDOWS_PYTHON_HID_TRANSPORT_SOURCE} is not valid UTF-8: {exc}",
+        ) from exc
+    return data
+
+
 def hid_transport_source(root: Path) -> bytes:
     """The sole .NET HID transport unit, packaged verbatim.
 
@@ -217,12 +290,15 @@ def hid_transport_source(root: Path) -> bytes:
     return data
 
 
-def hid_bootstrap_entry(stage0: bytes, transport: bytes) -> dict[str, object]:
-    """The Windows ``hid_bootstrap`` block: exact keys, hashes from the bytes."""
+def hid_bootstrap_entry(stage0: bytes, transport: bytes,
+                        stage0_name: str = WINDOWS_HID_STAGE0_NAME,
+                        transport_name: str = WINDOWS_HID_TRANSPORT_NAME
+                        ) -> dict[str, object]:
+    """One implementation's ``hid_bootstrap`` block: keys and byte hashes."""
     return {
-        "stage0": WINDOWS_HID_STAGE0_NAME,
+        "stage0": stage0_name,
         "stage0_sha256": hashlib.sha256(stage0).hexdigest(),
-        "transport": WINDOWS_HID_TRANSPORT_NAME,
+        "transport": transport_name,
         "transport_sha256": hashlib.sha256(transport).hexdigest(),
     }
 
@@ -273,7 +349,7 @@ def bundle_artifacts(root: Path) -> tuple[dict[str, object], list[tuple[str, byt
             "titella_slave_assets.__version__ is %r but the build declares %r"
             % (package_version, ASSETS_VERSION),
         )
-    python_payload = build_zipapp_bytes(root)
+    python_payload = build_zipapp_bytes(root, "posix")
     python_loader = loader_bytes(root, PYTHON_LOADER_NAME)
     windows_payload = build_windows_source(root)
     windows_loader = loader_bytes(root, WINDOWS_LOADER_NAME)
@@ -285,6 +361,33 @@ def bundle_artifacts(root: Path) -> tuple[dict[str, object], list[tuple[str, byt
         WINDOWS_PAYLOAD_NAME, WINDOWS_LOADER_NAME, windows_payload, windows_loader
     )
     windows_entry["hid_bootstrap"] = hid_bootstrap_entry(hid_stage0, hid_transport)
+
+    windows_python_payload = build_zipapp_bytes(root, "windows")
+    windows_python_loader = loader_bytes(root, WINDOWS_PYTHON_LOADER_NAME)
+    windows_python_stage0 = loader_bytes(root, WINDOWS_PYTHON_STAGE0_NAME)
+    _require_hid_artifact(WINDOWS_PYTHON_STAGE0_NAME, windows_python_stage0)
+    windows_python_transport = windows_python_transport_source(root)
+    _require_hid_artifact(WINDOWS_PYTHON_HID_TRANSPORT_NAME, windows_python_transport)
+    windows_python_entry = manifest_entry(
+        WINDOWS_PYTHON_PAYLOAD_NAME, WINDOWS_PYTHON_LOADER_NAME,
+        windows_python_payload, windows_python_loader,
+    )
+    windows_python_entry["hid_bootstrap"] = hid_bootstrap_entry(
+        windows_python_stage0, windows_python_transport,
+        stage0_name=WINDOWS_PYTHON_STAGE0_NAME,
+        transport_name=WINDOWS_PYTHON_HID_TRANSPORT_NAME,
+    )
+
+    # The DLL variant is the same C# source, the same loader template and the
+    # same HID artifacts as `windows-dotnet`: only the loader's compilation
+    # mode differs (the master renders `__AGENT_FORMAT__`). The entry names
+    # the existing artifacts instead of shipping a second copy, so the bytes
+    # cannot drift between the two variants.
+    windows_dll_entry = manifest_entry(
+        WINDOWS_PAYLOAD_NAME, WINDOWS_LOADER_NAME, windows_payload, windows_loader
+    )
+    windows_dll_entry["hid_bootstrap"] = hid_bootstrap_entry(hid_stage0, hid_transport)
+
     manifest: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "protocol": _protocol_version(root),
@@ -294,6 +397,8 @@ def bundle_artifacts(root: Path) -> tuple[dict[str, object], list[tuple[str, byt
                 PYTHON_PAYLOAD_NAME, PYTHON_LOADER_NAME, python_payload, python_loader
             ),
             "windows-dotnet": windows_entry,
+            "windows-dotnet-dll": windows_dll_entry,
+            "windows-python": windows_python_entry,
         },
     }
     artifacts: list[tuple[str, bytes]] = [
@@ -303,6 +408,10 @@ def bundle_artifacts(root: Path) -> tuple[dict[str, object], list[tuple[str, byt
         (WINDOWS_LOADER_NAME, windows_loader),
         (WINDOWS_HID_STAGE0_NAME, hid_stage0),
         (WINDOWS_HID_TRANSPORT_NAME, hid_transport),
+        (WINDOWS_PYTHON_PAYLOAD_NAME, windows_python_payload),
+        (WINDOWS_PYTHON_LOADER_NAME, windows_python_loader),
+        (WINDOWS_PYTHON_STAGE0_NAME, windows_python_stage0),
+        (WINDOWS_PYTHON_HID_TRANSPORT_NAME, windows_python_transport),
     ]
     return manifest, artifacts
 

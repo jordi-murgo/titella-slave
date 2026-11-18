@@ -1,0 +1,99 @@
+# Titella USB-only stage-0 loader (Windows Python agent): pulls the
+# loader from the Feature 0x11 snapshot and runs it.
+$ErrorActionPreference = 'Stop'
+$dl = [DateTime]::UtcNow.AddSeconds(30)
+$tok = '__HID_TOKEN__'
+$size = __HID_SIZE__
+$sha = '__HID_SHA256__'
+if (-not ('Titella.PythonHidStage0' -as [type])) {
+  Add-Type -Name PythonHidStage0 -Namespace Titella -MemberDefinition '
+[DllImport("kernel32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr CreateFileW(string p, uint a, uint sh, IntPtr z, uint di, uint fl, IntPtr t);
+[DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+[DllImport("hid.dll")] public static extern bool HidD_GetFeature(IntPtr h, [In, Out] byte[] b, uint n);
+[DllImport("hid.dll")] public static extern bool HidD_SetFeature(IntPtr h, [In] byte[] b, uint n);'
+}
+$dev = [IntPtr]::Zero; $n = 0
+[Console]::Write('Loading loader ')
+try {
+  $m = New-Object byte[] 64
+  $if = '#{4d1e55b2-f16f-11cf-88cb-001111000030}'
+  foreach ($d in @(Get-PnpDevice -PresentOnly -Class HIDClass -ErrorAction SilentlyContinue)) {
+    if (-not $d.InstanceId -or $d.InstanceId -notmatch '^HID\\VID_17EF&PID_A38F') { continue }
+    $path = '\\?\hid' + $d.InstanceId.Substring(3).Replace('\', '#') + $if
+    $path = $path.ToLowerInvariant()
+    $h = [IntPtr]::Zero
+    try {
+      $h = [Titella.PythonHidStage0]::CreateFileW($path, [uint32]3221225472, 3, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero)
+      if ($h.ToInt64() -eq -1) { continue }
+      $m[0] = 17
+      if (-not [Titella.PythonHidStage0]::HidD_GetFeature($h, $m, 64)) { continue }
+      if ($m[0] -ne 17 -or $m[1] -ne 1 -or $m[2] -ne 1 -or $m[3] -ne 0) { continue }
+      if (([BitConverter]::ToString($m, 4, 8) -replace '-', '') -cne $tok -or [BitConverter]::ToUInt32($m, 16) -ne $size) { continue }
+      $n++
+      if ($n -eq 1) { $dev = $h; $h = [IntPtr]::Zero }
+    } finally { if ($h.ToInt64() -gt 0) { [void][Titella.PythonHidStage0]::CloseHandle($h) } }
+  }
+  if ($n -eq 0) { throw 'not_found' }
+  if ($n -gt 1) { throw 'ambiguous' }
+  $buf = New-Object byte[] $size
+  $sel = New-Object byte[] 64; $sel[0] = 17; $sel[1] = 1; $sel[2] = 1
+  $tb = New-Object byte[] 8
+  foreach ($i in 0..7) { $tb[$i] = [Convert]::ToByte($tok.Substring($i * 2, 2), 16) }
+  [Array]::Copy($tb, 0, $sel, 4, 8)
+  $o = New-Object byte[] 64; $o[0] = 17
+  $off = 0
+  while ($off -lt $size) {
+    [BitConverter]::GetBytes([uint32]$off).CopyTo($sel, 12)
+    $len = 0
+    for ($t = 0; $t -lt 4 -and !$len; $t++) {
+      if ([DateTime]::UtcNow -ge $dl) { throw 'timeout' }
+      if (-not [Titella.PythonHidStage0]::HidD_SetFeature($dev, $sel, 64)) { continue }
+      if (-not [Titella.PythonHidStage0]::HidD_GetFeature($dev, $o, 64)) { continue }
+      if ($o[0] -ne 17 -or $o[1] -ne 1 -or $o[2] -ne 2) { continue }
+      if (([BitConverter]::ToString($o, 4, 8) -replace '-', '') -cne $tok -or [BitConverter]::ToUInt32($o, 12) -ne [uint32]$off -or [BitConverter]::ToUInt32($o, 16) -ne $size) { continue }
+      $x = [Math]::Min(44, $size - $off)
+      if ($o[3] -ne $x) { continue }
+      [Array]::Copy($o, 20, $buf, $off, $x)
+      $len = $x
+    }
+    if (!$len) { throw 'failed' }
+    $off += $len
+    [Console]::Write('.')
+  }
+  $c = [Security.Cryptography.SHA256]::Create()
+  try { $hex = ([BitConverter]::ToString($c.ComputeHash($buf)) -replace '-', '').ToLowerInvariant() }
+  finally { $c.Dispose() }
+  if ($hex -cne $sha) { throw 'checksum' }
+  [Console]::WriteLine(' OK')
+} catch {
+  [Console]::WriteLine(' ERROR')
+  throw
+} finally {
+  if ($dev.ToInt64() -gt 0) { [void][Titella.PythonHidStage0]::CloseHandle($dev) }
+}
+$ms = [IO.MemoryStream]::new($buf)
+$rd = New-Object IO.StreamReader ([IO.Compression.GzipStream]::new($ms, ([IO.Compression.CompressionMode]::Decompress)))
+try { $src = $rd.ReadToEnd() } finally { $rd.Dispose(); $ms.Dispose() }
+$i = $src.IndexOf('#@#')
+if ($i -lt 0) { throw 'no_marker' }
+$unit = $src.Substring($i + 3)
+$src = $src.Substring(0, $i)
+$exe = $null
+foreach ($c in @('python.exe', 'py.exe')) {
+  $cmd = Get-Command $c -ErrorAction SilentlyContinue
+  if ($cmd) { $exe = $cmd.Source; break }
+}
+if (-not $exe) { throw 'python_unavailable' }
+$dir = Join-Path ([IO.Path]::GetTempPath()) $tok
+New-Item -ItemType Directory -Path $dir -Force | Out-Null
+[IO.File]::WriteAllText((Join-Path $dir 'hid_transport.py'), $unit)
+[IO.File]::WriteAllText((Join-Path $dir 'loader.py'), $src)
+$psi = New-Object Diagnostics.ProcessStartInfo $exe
+$psi.Arguments = '"' + (Join-Path $dir 'loader.py') + '"'
+$psi.UseShellExecute = $false
+$psi.CreateNoWindow = $false
+$psi.WorkingDirectory = $dir
+$psi.EnvironmentVariables['TITELLA_STAGE_DIR'] = $dir
+$p = [Diagnostics.Process]::Start($psi)
+$p.WaitForExit()
+if ($p.ExitCode -ne 0) { throw 'python_loader_failed' }

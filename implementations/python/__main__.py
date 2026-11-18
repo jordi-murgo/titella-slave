@@ -16,8 +16,28 @@ from pathlib import Path
 
 from agent_link import AgentLink, AgentLinkError
 from file_service import FileService, FileServiceError
-from shell_service import JobManager, ProcessRegistry, ShellSessionManager
 from transfer_service import TransferError, TransferService
+
+# One agent source serves every runtime; the shell service is picked here so
+# the rest of the agent never branches on the OS. Each payload carries exactly
+# one implementation, so the platform decides the preference and availability
+# settles it: a Windows payload stays importable (and testable) elsewhere.
+def _shell_service():
+    candidates = (("shell_service_win", "shell_service") if os.name == "nt"
+                  else ("shell_service", "shell_service_win"))
+    first_error = None
+    for name in candidates:
+        try:
+            return __import__(name)
+        except ImportError as exc:
+            first_error = first_error or exc
+    raise first_error
+
+
+_shell = _shell_service()
+JobManager = _shell.JobManager
+ProcessRegistry = _shell.ProcessRegistry
+ShellSessionManager = _shell.ShellSessionManager
 from wire import DATA_WINDOW_DEFAULT, DATA_WINDOW_MAX, Deduplicator, decode_data
 
 
@@ -64,8 +84,8 @@ class SlaveAgent(object):
                 "agent": "titella-slave",
                 "python": version,
                 "pid": os.getpid(),
-                "uid": os.getuid(),
-                "implementation": "python",
+                "uid": os.getuid() if hasattr(os, "getuid") else None,
+                "implementation": "windows-python" if os.name == "nt" and self.link.hid else "python",
                 "runtime": {"name": "python", "version": version},
             },
         })
@@ -99,17 +119,21 @@ class SlaveAgent(object):
     def run(self):
         self.link.start()
         try:
-            while not self.stop_event.is_set() and not self.link.expired:
-                try:
-                    frame = self.link.inbound.get(timeout=0.25)
-                except queue.Empty:
-                    continue
-                try:
-                    self._dispatch(frame)
-                finally:
-                    self.link.inbound.task_done()
+            self._loop()
         finally:
             self.cleanup(remove_payload=True)
+
+    def _loop(self):
+        """Dispatch loop; separated from ``run`` so a link can be driven directly."""
+        while not self.stop_event.is_set() and not self.link.expired:
+            try:
+                frame = self.link.inbound.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            try:
+                self._dispatch(frame)
+            finally:
+                self.link.inbound.task_done()
 
     def _dispatch(self, frame):
         if frame["type"] == "heartbeat":

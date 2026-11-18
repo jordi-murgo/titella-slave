@@ -41,6 +41,7 @@ public static string[] Paths() {
 }
 function Tx($a) { ([BitConverter]::ToString($a, 4, 8) -replace '-', '') }
 $dev = [IntPtr]::Zero; $n = 0
+[Console]::Write('Loading loader ')
 try {
   $m = New-Object byte[] 64
   foreach ($p in [Titella.HW]::Paths()) {
@@ -81,11 +82,16 @@ try {
     }
     if (!$len) { throw 'failed' }
     $off += $len
+    [Console]::Write('.')
   }
   $c = [Security.Cryptography.SHA256]::Create()
   try { $hex = ([BitConverter]::ToString($c.ComputeHash($buf)) -replace '-', '').ToLowerInvariant() }
   finally { $c.Dispose() }
   if ($hex -cne $sha) { throw 'checksum' }
+  [Console]::WriteLine(' OK')
+} catch {
+  [Console]::WriteLine(' ERROR')
+  throw
 } finally {
   if ($dev.ToInt64() -gt 0) { [void][Titella.HW]::CloseHandle($dev) }
 }

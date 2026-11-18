@@ -1,12 +1,18 @@
-"""Stdlib-only CDC link of the ephemeral agent.
+"""Stdlib-only link of the ephemeral agent.
 
-The native CDC port is the default transport; port "CLIPBOARD" selects the
-shared-desktop-clipboard transport used by agent_protocol = "clipboard".
+Three transports share one frame pipeline:
+
+- the native CDC port (default on POSIX);
+- the shared desktop clipboard, selected with port ``CLIPBOARD``
+  (``agent_protocol = "clipboard"``);
+- the HID data collection of the rig, selected with a ``HID:<serial>``
+  binding (``slave_transport = "hid"``), which needs no COM port, no clipboard
+  and no network on the target and is the only one a bare Windows host can
+  use with nothing installed.
 """
 from __future__ import print_function
 
 import errno
-import fcntl
 import glob
 import itertools
 import os
@@ -15,9 +21,17 @@ import re
 import select
 import shutil
 import subprocess
-import termios
 import threading
 import time
+
+# The CDC transport is the only part that needs POSIX termios; a Windows host
+# carries the HID transport instead and must still import this module.
+try:
+    import fcntl
+    import termios
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+    termios = None
 
 from wire import (
     DATA_CHUNK_BYTES,
@@ -42,6 +56,17 @@ _CLIPBOARD_PORT = "CLIPBOARD"
 
 def _is_clipboard_port(port):
     return isinstance(port, str) and port.strip().upper() == _CLIPBOARD_PORT
+
+
+def is_hid_port(port):
+    """True for a ``HID:<12 uppercase hex>`` binding, the USB-only transport."""
+    if not isinstance(port, str):
+        return False
+    value = port.strip()
+    if not value.startswith("HID:"):
+        return False
+    serial = value[4:]
+    return len(serial) == 12 and all(c in "0123456789ABCDEF" for c in serial)
 
 
 class _ClipboardTransport(object):
@@ -279,7 +304,9 @@ class AgentLink(object):
         self.link_id = link_id
         self.port_arg = port
         self.clipboard = _is_clipboard_port(port)
+        self.hid = is_hid_port(port)
         self._cb = _ClipboardTransport(link_id) if self.clipboard else None
+        self._hs = None
         self.heartbeat_s = heartbeat_s
         self.grace_s = grace_s
         self.on_connect = on_connect
@@ -303,14 +330,20 @@ class AgentLink(object):
 
     @property
     def connected(self):
-        if self._connected.is_set() and (self._fd is not None or self._cb is not None):
+        if self._connected.is_set() and (
+                self._fd is not None or self._cb is not None or self._hs is not None):
             return True
         return False
 
     def start(self):
         if self._threads:
             return
-        reader = self._clipboard_reader_loop if self.clipboard else self._reader_loop
+        if self.clipboard:
+            reader = self._clipboard_reader_loop
+        elif self.hid:
+            reader = self._hid_reader_loop
+        else:
+            reader = self._reader_loop
         self._threads = [
             threading.Thread(target=reader, name="agent-cdc-reader", daemon=True),
             threading.Thread(target=self._writer_loop, name="agent-cdc-writer", daemon=True),
@@ -391,6 +424,7 @@ class AgentLink(object):
         with self._fd_lock:
             fd, self._fd = self._fd, None
             clipboard, self._cb = self._cb, None
+            hid, self._hs = self._hs, None
             self._connected.clear()
         if fd is not None:
             try:
@@ -399,6 +433,11 @@ class AgentLink(object):
                 pass
         if clipboard is not None:
             clipboard.close()
+        if hid is not None:
+            try:
+                hid.close()
+            except OSError:
+                pass
 
     def _lost(self):
         if self.disconnected_since is None:
@@ -451,6 +490,47 @@ class AgentLink(object):
                 self._ingest(chunk)
             except (OSError, ValueError):
                 self._lost()
+
+    def _hid_reader_loop(self):
+        """HID counterpart of the CDC reader: open the collection, then read."""
+        attempt = 0
+        while not self._stop.is_set():
+            try:
+                import hid_transport
+                stream = hid_transport.open_stream(self.port_arg.strip())
+            except (OSError, ValueError):
+                delay = _BACKOFF[min(attempt, len(_BACKOFF) - 1)]
+                attempt += 1
+                self._stop.wait(delay)
+                continue
+            with self._fd_lock:
+                self._hs = stream
+                self.port = self.port_arg.strip()
+                self._parser = FrameParser(FIRMWARE_TO_SLAVE, ignore_invalid=True)
+                self._connected.set()
+            if self.on_connect:
+                self.on_connect()
+            while not self._stop.is_set():
+                try:
+                    chunk = stream.read(4096)
+                except (OSError, ValueError):
+                    break
+                if not chunk:
+                    continue
+                self._ingest(chunk)
+            with self._fd_lock:
+                hid, self._hs = self._hs, None
+                self._connected.clear()
+            if hid is not None:
+                try:
+                    hid.close()
+                except OSError:
+                    pass
+            if self._stop.is_set():
+                return
+            self.disconnected_since = self.disconnected_since or time.monotonic()
+            attempt += 1
+            self._stop.wait(_BACKOFF[min(attempt, len(_BACKOFF) - 1)])
 
     def _clipboard_reader_loop(self):
         """Clipboard counterpart of the CDC reader: poll, ingest, repeat."""
@@ -517,6 +597,24 @@ class AgentLink(object):
                     except OSError:
                         # A closed channel is the teardown path, not a loss.
                         pass
+                    continue
+                if self.hid:
+                    # Same discipline as the CDC: wait for a bound stream
+                    # instead of dropping the frame. Write returns once the
+                    # peer acknowledged the bytes, so the stream, not this
+                    # loop, owns retransmission.
+                    while not self._stop.is_set():
+                        if not self._connected.wait(0.25):
+                            continue
+                        with self._fd_lock:
+                            stream = self._hs
+                        if stream is None:
+                            continue
+                        try:
+                            stream.write(payload)
+                            break
+                        except (OSError, ValueError):
+                            self._lost()
                     continue
                 while not self._stop.is_set():
                     if not self._connected.wait(0.25):

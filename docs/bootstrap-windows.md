@@ -85,26 +85,64 @@ task or exclusion. If a policy blocks `FullLanguage`, the framework version or
    512-byte blocks with per-block ACK; duplicates are re-acknowledged but not
    applied twice, and gaps are never written or acknowledged.
 6. The loader verifies size and SHA-256 and moves the payload into the
-   bootstrap directory, then compiles it to **agent.exe** with the framework's
-   own `csc.exe` (`/target:exe /main:Titella.Slave.AgentHost`, the same
-   reference set the payload has always needed), deletes the source, writes
-   the fixed `agent.json` next to the executable and starts `agent.exe`
-   directly — no powershell.exe child, no `-EncodedCommand`, no script text
-   in any classic PowerShell log channel. A compile failure keeps
-   `agent-compile.err.log` and is reported through the loader's error flow.
-   The loader closes the CDC before the agent starts; the agent reopens the
-   same port.
-7. `agent.exe` reads `agent.json` and enters `Agent.Run`, which calls
+   bootstrap directory, then compiles it with the framework's own `csc.exe`
+   and the same reference set the payload has always needed. The compile mode
+   follows the selected implementation: `windows-dotnet` produces
+   **agent.exe** (`/target:exe /main:Titella.Slave.AgentHost`) started
+   directly, while `windows-dotnet-dll` produces **agent.dll**
+   (`/target:library`) which a separate Windows PowerShell 5.1 process loads
+   from disk and invokes. In both cases the source is deleted after a
+   successful compile, the fixed `agent.json` is written next to the assembly,
+   and no `-EncodedCommand` or script text reaches a classic PowerShell log
+   channel. A compile failure keeps `agent-compile.err.log` and is reported
+   through the loader's error flow. The loader closes the CDC before the agent
+   starts; the agent reopens the same port.
+7. The agent reads `agent.json` and enters `Agent.Run`, which calls
    `FreeConsole`: closing the original console window does not stop the agent.
    `agent.json` carries the bootstrap directory, the `link_id`, the resolved
-   port, a 5000 ms heartbeat and a 30000 ms grace window. Later job children
-   are the same executable started with `--job`, so a job's host is the agent
-   itself, never powershell.exe.
-8. The agent emits `control.hello` with `implementation: "windows-dotnet"`,
+   port, a 5000 ms heartbeat and a 30000 ms grace window; the DLL variant adds
+   `implementation: "windows-dotnet-dll"`, and the assembly kind decides which
+   value is accepted — an exe rejects that field unless it says
+   `windows-dotnet`, and a library rejects anything else, including its
+   absence. Later job children are launched from the same assembly: agent.exe
+   started with `--job`, or the hosting PowerShell process loading agent.dll
+   and calling `AgentHost.Main(['--job'])`. The user script still arrives over
+   stdin, so it never appears in the child's command line.
+8. The agent emits `control.hello` with the implementation it was started as
+   (`windows-dotnet` or `windows-dotnet-dll`),
    `runtime: {name: "dotnet-framework", version: <NDP Version>}`,
    `python: null`, `uid: null`, the real `pid` and `agent: "titella-slave"`.
    The master sends `control.bind` and reports success only after
    `status=ready`.
+
+The DLL variant exists to measure the same agent where an executable image is
+refused, not as a stealth mode: it adds a PowerShell host process and the
+telemetry that comes with it, and a reflection load is not the image-loading
+path a policy engine validates. Whether a host admits it is decided by that
+host's controls and observed there.
+
+Observed on one hardened Windows 11 host (HP EliteBook, WDAC `DefaultWindowsAudit`
+`{e0abda1f-ccf0-468e-8855-3e0f08b02d6a}` in audit mode, Defender ASR enabled):
+
+- **Admission.** CodeIntegrity `3076` recorded `powershell.exe` loading the
+  generated `agent.dll` and said "the image was allowed to load" **because the
+  policy is auditing**. No ASR `1121`/`1122` was raised for the DLL or for any
+  job. A host with that policy enforced, or with AppLocker DLL rules, decides
+  the opposite — the event is the evidence, not the successful bootstrap.
+- **Telemetry the exe path does not have.** Every job child starts with
+  `-Command "[void][Reflection.Assembly]::LoadFrom('…\agent.dll'); exit
+  ([Titella.Slave.AgentHost]::Main([string[]]@('--job')))"`. With PowerShell
+  script-block logging on, that literal is written to event `4104` once per
+  job, with the full DLL path. This is a real detectability regression
+  relative to `windows-dotnet`, which puts only `--job` on a child command
+  line.
+- **Containment survives.** Timeout and cancellation return
+  `0xC000013A` (TerminateJobObject), the grandchild stops writing and no
+  `ping.exe` survives; the exit code propagates (`exit 7` → 7) and stdout
+  carries only the script output.
+
+So the variant is a measurement instrument for admission decisions, not a
+quieter payload. Report it that way.
 
 ## CDC port resolution
 
@@ -184,7 +222,8 @@ from opening the same collection.
 ### USB-only bootstrap
 
 A HID rig has no CDC, no shared clipboard and no network reach, so the
-bootstrap types exactly one line and pulls everything else over USB:
+bootstrap types a short launcher and a separate Base64 line, then pulls the
+loader and agent over USB:
 
 1. The master stages the compressed loader container in the firmware's
    Feature 0x11 mailbox over the UART (`loader_stage_begin`,
@@ -193,10 +232,11 @@ bootstrap types exactly one line and pulls everything else over USB:
    snapshot expires 180 s after commit. The container is the rendered
    loader, the `#@#` marker and the `HidByteStream` unit as raw UTF-8: no
    Base64 transport source is ever registered as script text.
-2. The master types the stage-0 line — at most 3328 characters (~26.6 s of
-   pacing), gzip+base64 of the rendered
-   `loaders/windows-hid-stage0.ps1.tmpl` — into the prepared console. The
-   stage-0 loader enumerates the present HID interfaces with SetupDi and
+2. The master types a short launcher and then the gzip+Base64 stage-0 script
+   into the prepared console. The launcher reads the second line with
+   `[Console]::ReadLine()` and runs it. Both lines and their Enter keys must
+   fit 3328 characters (~26.6 s of pacing). The stage-0 loader enumerates the
+   present HID interfaces with SetupDi and
    keeps only paths carrying the rig identity (VID `0x17EF`, PID `0xA38F`);
    it admits the one whose metadata answers the expected token, version and
    size, downloads the snapshot in 44-byte blocks (four attempts per block,
@@ -219,10 +259,16 @@ bootstrap types exactly one line and pulls everything else over USB:
    On stop the agent empties its directory except the running image and
    `owner.json`, which only the next bootstrap's sweep can remove.
 
+The console prints one dot for each newly accepted mailbox block (up to 44
+bytes), then for each newly written agent block (up to 512 bytes). Retries and
+duplicates add no dots. Each transfer ends with `OK` or `ERROR`. The launcher
+may be saved in PowerShell history; console echo, transcription, AMSI and
+script-block logging remain separate exposure paths.
+
 The stage-0 helper only reads Feature reports of candidates whose metadata
 matches the staged snapshot; it never changes another device. A snapshot that
-exceeds 32768 bytes or a stage-0 line over 3328 characters fails the bootstrap
-before any keystroke.
+exceeds 32768 bytes or combined stage-0 input over 3328 characters fails the
+bootstrap before any keystroke.
 The CDC and clipboard rigs above keep their current behaviour; HID is selected
 per instance by configuration, never by an automatic fallback.
 
@@ -261,7 +307,7 @@ unobservable one — surfaces as `agent_stop_timeout` instead of a silent
 | Stage | Wait |
 |---|---|
 | Launcher (Start search) and stub typing | 8 ms per character; each HID request is at most 256 characters. The stub is about 80 characters, so the typed stage is under a second. The loader arrives over the CDC. |
-| HID stage-0 line | At most 3072 characters at 8 ms per character: up to 24.576 s of character pacing, plus request overhead and execution. This is a budget, not a measured bootstrap time. |
+| HID stage-0 input | Launcher, Base64 line and two Enter keys: at most 3328 characters at 8 ms per character, plus request overhead and execution. This is a budget, not a measured bootstrap time. |
 | HID snapshot download | 44-byte blocks, four attempts per block, 30 s total budget. |
 | `loader.ready` after the launcher | 30 s |
 | `control.hello` after the payload commit | 90 s (including the C# compile) |
@@ -285,16 +331,18 @@ The agent implements the full protocol v1 surface, not a reduced subset:
   default / 64 KiB maximum, write 64 KiB, list 200, search 200, find 500,
   transfer 512 MiB, window 1..64 with a default of 8);
 - `shell.job.start/cancel`, output events and results; each job is the agent
-  executable itself started with `--job` and assigned to a job object
+  assembly itself started with `--job` and assigned to a job object
   (cancellation and timeouts kill the whole tree). The command line carries
   no user script: `--job` boots the in-process Runspace runner (`JobEntry`)
-  inside `agent.exe`, while the script itself travels over stdin and executes
-  in a custom `PSHost`. No powershell.exe child is spawned for a job, so no
-  classic PowerShell log channel records a job start; the script remains
-  subject to PowerShell engine logging and endpoint security policy inside
-  the Runspace. PowerShell semantics are preserved: stdout and stderr are
-  captured separately, `exit 7` returns 7 and any cmdlet error returns 1,
-  exactly like a `powershell.exe -Command` child;
+  inside the agent, while the script itself travels over stdin and executes
+  in a custom `PSHost`. Under `windows-dotnet` the child is `agent.exe`; under
+  `windows-dotnet-dll` it is the PowerShell host that loads `agent.dll` and
+  calls the same entry point, so the DLL variant adds one process per job that
+  the exe variant does not have. The script remains subject to PowerShell
+  engine logging and endpoint security policy inside the Runspace.
+  PowerShell semantics are preserved: stdout and stderr are captured
+  separately, `exit 7` returns 7 and any cmdlet error returns 1, exactly like
+  a `powershell.exe -Command` child;
 - `terminal.open/write/resize/close` over ConPTY (`CreatePseudoConsole`,
   `STARTUPINFOEX`, `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`,
   `CreateProcessW`, `ResizePseudoConsole`) with the system PowerShell 5.1 as
@@ -360,7 +408,7 @@ does not invent a remote error it could not receive.
 | `cdc_ambiguous` | Several Titella CDC ports are present. Pass `slave_cdc_port`. | Yes, with a correct port. |
 | `slave_transport_unsupported` | `slave_transport=hid` was selected but the flashed firmware does not advertise the HID data protocol (older than 1.6.0), or the bundle carries no stage-0 microloader. | No fallback; reflash or switch the selection. |
 | `hid_loader_too_large` | The compressed loader exceeds the 32768-byte firmware snapshot. | No; shrink the loader. |
-| `hid_stage0_too_large` | The typed stage-0 line exceeds the 3072-character keystroke budget. | No; shrink the microloader. |
+| `hid_stage0_too_large` | The typed stage-0 input exceeds the 3328-character keystroke budget. | No; shrink the microloader. |
 | `agent_stop_timeout` | A stop was sent but `hid.health` never reported `slave_connected: false` for the selected destination within the wait. The old stream may still be attached. | Yes, once the state proves closed (or after checking the agent/console). |
 | `bootstrap_loader_timeout` | The loader did not announce `loader.ready`: launcher focus, a policy block before the port opens, or a port that cannot be opened. | Yes, after fixing the named cause. |
 | `cdc_disconnected` | The loader lost the CDC while reading frames (unplugged device or port reset) before the commit. | Yes, after checking the cable and the port. |

@@ -13,11 +13,44 @@ from pathlib import Path
 
 # The zipapp loads these modules flat (wire.py, screen_service.py next to it),
 # while the repository tests import them under implementations.python. Both
-# layouts must resolve the same module.
-try:
-    from screen_service import ScreenCaptureError
-except ImportError:  # pragma: no cover - repository layout only
-    from .screen_service import ScreenCaptureError
+# layouts must resolve the same module. Windows has its own capture service;
+# the error type is the shared contract, so the selector happens once here.
+# Exactly one capture service travels in each payload, so availability is the
+# ground truth and the platform only decides which is tried first. This keeps
+# the Windows payload importable (and therefore testable) on a host that is
+# not Windows, instead of failing at import time.
+_SCREEN_PREFERENCE = ("screen_service_win", "screen_service")
+
+
+def _platform_module(preference):
+    """Imports the first module of ``preference`` present in this payload.
+
+    The payload loads its modules flat and the repository tests load them as a
+    package, so each candidate is tried as a top-level module first and as a
+    relative one afterwards; a candidate that is simply absent moves on to the
+    next instead of aborting the selection.
+    """
+    from importlib import import_module
+
+    first_error = None
+    for name in preference:
+        for loader in (lambda: __import__(name),
+                       lambda: import_module("." + name, __package__)):
+            try:
+                return loader()
+            except ImportError as exc:
+                if first_error is None:
+                    first_error = exc
+            except TypeError:
+                # No package context: this layout only has flat modules.
+                pass
+    raise first_error
+
+
+_screen_module = _platform_module(
+    ("screen_service_win", "screen_service") if os.name == "nt"
+    else ("screen_service", "screen_service_win"))
+ScreenCaptureError = _screen_module.ScreenCaptureError
 
 MAX_READ_BYTES = 64 * 1024
 DEFAULT_READ_BYTES = 32 * 1024
@@ -26,6 +59,11 @@ MAX_LIST_ENTRIES = 200
 MAX_SEARCH_RESULTS = 200
 MAX_FIND_RESULTS = 500
 MAX_SEARCH_READ = 4 * 1024 * 1024
+
+
+def _optional(call):
+    """Value of a POSIX-only accessor, or None where the call does not exist."""
+    return call() if call is not None else None
 
 
 class FileServiceError(RuntimeError):
@@ -194,8 +232,10 @@ class FileService(object):
             "machine": uname.machine,
             "hostname": uname.node,
             "python": platform.python_version(),
-            "uid": os.getuid(),
-            "gid": os.getgid(),
+            # Windows has no uid/gid: reporting a synthetic 0 would claim a
+            # privilege level this process does not have.
+            "uid": _optional(getattr(os, "getuid", None)),
+            "gid": _optional(getattr(os, "getgid", None)),
             "home": str(Path.home()),
             "runtime": {"name": "python", "version": platform.python_version()},
         }
@@ -244,12 +284,7 @@ class FileService(object):
     def screen(self):
         """One PNG of the local graphical session; the payload carries bytes."""
         if self._screen is None:
-            try:
-                from screen_service import ScreenService
-            except ImportError:  # pragma: no cover - repository layout only
-                from .screen_service import ScreenService
-
-            self._screen = ScreenService()
+            self._screen = _screen_module.ScreenService()
         try:
             metadata, image = self._screen.capture()
         except ScreenCaptureError as exc:

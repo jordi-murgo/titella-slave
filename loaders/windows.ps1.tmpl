@@ -12,13 +12,14 @@
 #
 # Placeholders: __LINK_ID__, __SESSION_ID__, __CDC_PORT__ (empty = resolve the
 # port from the PnP identity of the rig; 'CLIPBOARD' and 'HID:<serial>' are
-# internal sentinels of this field, never public port values) plus the trailing
-# transport-source constant, substituted only for the HID sentinel.
+# internal sentinels of this field, never public port values), the trailing
+# transport-source constant and the agent format ('exe' or 'dll'), substituted
+# only for the HID sentinel and the selected .NET variant respectively.
 $ErrorActionPreference = 'Stop'
-try { Set-PSReadLineOption -HistorySaveStyle SaveNothing } catch { }
 $script:L = '__LINK_ID__'
 $script:S = '__SESSION_ID__'
 $script:Pin = '__CDC_PORT__'
+$script:Fmt = '__AGENT_FORMAT__'   # exe: agent.exe; dll: agent.dll hosted by powershell.exe
 if (-not ($script:Sp -and $script:Sp.IsOpen)) { $script:Sp = $null }
 $script:Rx = $null      # read stream
 $script:Tx = $null      # write stream
@@ -284,6 +285,7 @@ function Handle-Frame($f) {
       Log ('payload installed, starting the agent on ' + $resolved)
       Start-Agent $resolved
       if ($script:Hid) {
+        [Console]::WriteLine(' OK')
         # HID keeps this console usable for another bootstrap.
         $script:Done = $true
       } else {
@@ -300,7 +302,10 @@ function Handle-Frame($f) {
     try { $chunk = [Convert]::FromBase64String([string]$f.data_b64) }
     catch { throw (Fail 'invalid_argument' 'data carries invalid base64') }
     if ($chunk.Length -gt 512) { throw (Fail 'invalid_argument' 'a data chunk exceeds 512 bytes') }
-    if ($seq -eq $script:Sq) { $script:Wr.Write($chunk, 0, $chunk.Length); $script:Sq++ }
+    if ($seq -eq $script:Sq) {
+      $script:Wr.Write($chunk, 0, $chunk.Length); $script:Sq++
+      if ($script:Hid) { [Console]::Write('.') }
+    }
     if ($seq -le $script:Sq) {
       Send @{ v = 1; channel = 'bootstrap'; type = 'ack'; link_id = $script:L; session_id = $script:S; ack_seq = $seq }
     }
@@ -313,20 +318,22 @@ function Start-Agent([string]$Name) {
   $sma = Join-Path $env:WINDIR 'Microsoft.NET\assembly\GAC_MSIL\System.Management.Automation'
   $sma = Get-ChildItem $sma -Recurse -Filter 'System.Management.Automation.dll' -ErrorAction SilentlyContinue |
     Select-Object -First 1 -ExpandProperty FullName
-  # Compile the received source to agent.exe with the framework's own csc and
-  # start it directly: no powershell.exe child, no Add-Type, no script text in
-  # any classic PowerShell log channel. The compile is synchronous (seconds)
-  # stays inside the bootstrap hello wait; on failure the compile log is
-  # kept and the loader's error flow reports it instead of starting anything.
-  $exe = Join-Path $script:Rt 'agent.exe'
+  # Compile the received source with the framework's own csc: agent.exe, which
+  # starts directly, or agent.dll, hosted by a separate Windows PowerShell 5.1
+  # process. The compile is synchronous (seconds) and stays inside the
+  # bootstrap hello wait; on failure the compile log is kept and the loader's
+  # error flow reports it instead of starting anything.
+  $dll = ($script:Fmt -eq 'dll')
+  $out = Join-Path $script:Rt $(if ($dll) { 'agent.dll' } else { 'agent.exe' })
   $errLog = Join-Path $script:Rt 'agent-compile.err.log'
   $refs = @('System.dll', 'System.Core.dll', 'System.Web.Extensions.dll', 'System.Drawing.dll') |
     ForEach-Object { '/r:' + (Join-Path $fw $_) }
   if ($sma) { $refs += ('/r:' + $sma) }
+  $target = if ($dll) { '/target:library' } else { '/target:exe', '/main:Titella.Slave.AgentHost' }
   $eap = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
   try {
-    & (Join-Path $fw 'csc.exe') /nologo /target:exe /main:Titella.Slave.AgentHost "/out:$exe" $refs $script:Cs 2> $errLog
+    & (Join-Path $fw 'csc.exe') /nologo $target "/out:$out" $refs $script:Cs 2> $errLog
   } catch {
     $ErrorActionPreference = $eap
     throw (Fail 'payload_compile_failed' ('csc could not run: ' + $_.Exception.Message))
@@ -338,8 +345,8 @@ function Start-Agent([string]$Name) {
   }
   [IO.File]::Delete($script:Cs)
   if (Test-Path -LiteralPath $errLog) { if ((Get-Item -LiteralPath $errLog).Length -eq 0) { Remove-Item -LiteralPath $errLog -Force -ErrorAction SilentlyContinue } }
-  # The fixed agent.json next to the executable carries every argument the
-  # agent needs; the process itself starts with no command line at all.
+  # The fixed agent.json next to the assembly carries every argument the agent
+  # needs; the process itself starts with no command line at all.
   $config = [ordered]@{
     bootstrap_dir = $script:Rt
     link_id       = $script:L
@@ -347,13 +354,40 @@ function Start-Agent([string]$Name) {
     heartbeat_ms  = 5000
     grace_ms      = 30000
   }
+  if ($dll) { $config['implementation'] = 'windows-dotnet-dll' }
   [IO.File]::WriteAllText((Join-Path $script:Rt 'agent.json'), (ConvertTo-Json $config -Compress),
     (New-Object Text.UTF8Encoding $false))
-  $psi = New-Object Diagnostics.ProcessStartInfo $exe
+  if (-not $dll) {
+    $psi = New-Object Diagnostics.ProcessStartInfo $out
+    $psi.WorkingDirectory = $script:Rt
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    [Diagnostics.Process]::Start($psi) | Out-Null
+    return
+  }
+  # DLL variant: a Windows PowerShell 5.1 process of its own loads the
+  # assembly from disk and invokes the same entry point the exe exposes.
+  # [void] keeps the Assembly object off stdout; a load or invocation failure
+  # is written to agent-load.err.log inside this run's directory and exits 1.
+  # $Host is an automatic, read-only variable: the agent host path uses its
+  # own name, or assigning it fails with "cannot overwrite variable host".
+  $agentHost = Join-Path $PSHOME 'powershell.exe'
+  if (-not (Test-Path -LiteralPath $agentHost)) {
+    throw (Fail 'payload_start_failed' ('the agent host is missing: ' + $agentHost))
+  }
+  $path = $out.Replace("'", "''")
+  $code = "try { [void][Reflection.Assembly]::LoadFrom('" + $path + "'); exit ([Titella.Slave.AgentHost]::Main([string[]]@())) } catch { [IO.File]::WriteAllText('" + (Join-Path $script:Rt 'agent-load.err.log').Replace("'", "''") + "', `$_.Exception.ToString()); exit 1 }"
+  $argLine = '-NoLogo -NoProfile -NonInteractive -Command "' + $code.Replace('"', '\"') + '"'
+  $psi = New-Object Diagnostics.ProcessStartInfo $agentHost
+  $psi.Arguments = $argLine
   $psi.WorkingDirectory = $script:Rt
   $psi.UseShellExecute = $false
   $psi.CreateNoWindow = $true
-  [Diagnostics.Process]::Start($psi) | Out-Null
+  try {
+    [Diagnostics.Process]::Start($psi) | Out-Null
+  } catch {
+    throw (Fail 'payload_start_failed' ('the agent host could not start: ' + $_.Exception.Message))
+  }
 }
 
 # One bounded byte buffer shared by every transport loop: 4096-byte lines,
@@ -435,6 +469,7 @@ try {
       throw (Fail 'invalid_argument' ('the HID binding must be HID:<12 uppercase hex characters>, got ' + $script:Pin))
     }
     $script:Hid = $true
+    [Console]::Write('Loading agent ')
   }
   if ($script:Cb) {
     $script:PortName = 'CLIPBOARD'
@@ -559,6 +594,7 @@ try {
     }
     $c = $c.InnerException
   }
+  if ($script:Hid) { [Console]::WriteLine(' ERROR') }
   Log ($code + ': ' + $message)
   if ($script:Wr) { try { $script:Wr.Dispose() } catch { }; $script:Wr = $null }
   if ($script:Pt -and (Test-Path -LiteralPath $script:Pt)) { try { [IO.File]::Delete($script:Pt) } catch { } }

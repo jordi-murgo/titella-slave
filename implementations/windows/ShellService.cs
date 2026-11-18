@@ -3,9 +3,10 @@
 // model: every child is created suspended, assigned to a job object with
 // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, and only then resumed. Cancellation
 // and timeouts use TerminateJobObject; POSIX signals are neither available
-// nor simulated. A job child is the agent executable itself (--job): no
-// powershell.exe process is spawned for jobs, so no classic PowerShell log
-// channel records a job start.
+// nor simulated. A job child is the agent assembly itself (--job): agent.exe
+// starts directly, a hosted agent.dll is loaded by the PowerShell process
+// that already runs the agent. The user script always travels over stdin, so
+// no classic PowerShell log channel records its text.
 
 namespace Titella.Slave
 {
@@ -80,9 +81,11 @@ namespace Titella.Slave
     }
 
     /// <summary>
-    /// Path of the system Windows PowerShell. It is only the default shell
-    /// of ConPTY terminals (operator interaction); jobs never run it, and the
-    /// job child is the agent executable itself with --job.
+    /// Path of the system Windows PowerShell. It is the default shell of
+    /// ConPTY terminals (operator interaction) and, under the
+    /// `windows-dotnet-dll` implementation, the process that hosts the
+    /// agent's job children; under `windows-dotnet` jobs never run it, and
+    /// the job child is the agent executable itself with --job.
     /// </summary>
     internal static class PowerShell
     {
@@ -218,12 +221,14 @@ namespace Titella.Slave
             string script =
                 "[Console]::InputEncoding=[System.Text.Encoding]::UTF8;" +
                 "$OutputEncoding=[System.Text.Encoding]::UTF8;" + command;
-            // The child is the agent executable itself: "<agent.exe>" --job
-            // boots JobEntry, which reads the script from stdin. No
-            // powershell.exe child and no assembly-loading command line.
-            string image = Agent.ExecutableAssembly();
-            StringBuilder commandLine = new StringBuilder();
-            commandLine.Append('"').Append(image).Append("\" --job");
+            // The child is the agent itself: agent.exe started as
+            // "<agent.exe>" --job, or, when the agent is a hosted library,
+            // powershell.exe loading agent.dll and calling the same entry
+            // point with --job. JobEntry reads the script from stdin in both
+            // cases, so the script never reaches any command line.
+            string image;
+            StringBuilder commandLine;
+            LaunchCommand(out image, out commandLine);
 
             Win32Structs.SECURITY_ATTRIBUTES inheritable =
                 new Win32Structs.SECURITY_ATTRIBUTES();
@@ -389,6 +394,66 @@ namespace Titella.Slave
                     Marshal.FreeHGlobal(inheritableBlock);
                 }
             }
+        }
+
+        /// <summary>
+        /// Image and command line of one job child. An exe image is itself
+        /// started with --job; a hosted library is loaded by the same
+        /// PowerShell host that runs this agent, from its own path, and then
+        /// calls the shared entry point. Paths are PowerShell literals with
+        /// doubled apostrophes; no user data takes part in the command.
+        /// </summary>
+        internal static void LaunchCommand(out string image, out StringBuilder commandLine)
+        {
+            LaunchCommand(Agent.ExecutableAssembly(), out image, out commandLine);
+        }
+
+        /// <summary>
+        /// The branch itself, with the assembly path supplied: an exe image
+        /// runs with --job, a library is loaded by the PowerShell host that
+        /// runs the agent. Split out so the shape is testable without having
+        /// to host the agent from a .dll.
+        /// </summary>
+        internal static void LaunchCommand(string assembly, out string image,
+                                           out StringBuilder commandLine)
+        {
+            commandLine = new StringBuilder();
+            if (string.Equals(
+                    Path.GetExtension(assembly), ".dll", StringComparison.OrdinalIgnoreCase))
+            {
+                string host = null;
+                try
+                {
+                    using (System.Diagnostics.Process current =
+                           System.Diagnostics.Process.GetCurrentProcess())
+                    {
+                        host = current.MainModule.FileName;
+                    }
+                }
+                catch (Exception)
+                {
+                    host = null;
+                }
+                if (string.IsNullOrEmpty(host))
+                {
+                    throw new ProtocolError(
+                        "operation_failed",
+                        "the agent host process has no image path",
+                        false);
+                }
+                string script =
+                    "[void][Reflection.Assembly]::LoadFrom('"
+                    + assembly.Replace("'", "''")
+                    + "'); exit ([Titella.Slave.AgentHost]::Main([string[]]@('--job')))";
+                image = host;
+                commandLine.Append('"').Append(host).Append('"')
+                           .Append(" -NoLogo -NoProfile -NonInteractive -Command \"")
+                           .Append(script)
+                           .Append('"');
+                return;
+            }
+            image = assembly;
+            commandLine.Append('"').Append(assembly).Append("\" --job");
         }
 
         private static void CloseHandle(ref IntPtr handle)
